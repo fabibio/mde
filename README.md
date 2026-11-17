@@ -5,8 +5,18 @@ Reader GUI per file Markdown con visualizzazione a **tab**, scritto in Python co
 ## Funzionalità
 
 - **Più file in tab dedicate**: apri quanti file vuoi, ognuno nella sua tab (tab trascinabili, chiudibili con la `X`).
-- **Vista split**: sorgente Markdown a sinistra, anteprima renderizzata a destra.
-  Con `Ctrl+Shift+L` si nasconde la sorgente e resta solo la modalità lettura.
+- **Due riquadri indipendenti**: sorgente Markdown e anteprima formattata si
+  mostrano/nascondono singolarmente dal menu *Visualizza* (`Ctrl+Shift+E` /
+  `Ctrl+Shift+P`); almeno un riquadro resta sempre visibile.
+- **Menu *Impostazioni*** (`Ctrl+,`), con valori predefiniti pari al comportamento
+  attuale e persistiti su disco (`~/.config/mdv/mdv.conf`):
+  - **vista all'apertura**: split view, solo anteprima formattata o solo sorgente;
+  - **font e dimensioni** per ciascun dei due riquadri;
+  - **colore del testo** per ciascun riquadro (default: colore del tema);
+  - **colorazione della sintassi** della sorgente, attivabile/disattivabile.
+  Le modifiche si applicano subito a tutti i file aperti e vengono ricordate
+  alla prossima apertura; un pulsante *Ripristina predefiniti* riporta tutto
+  al valore iniziale.
 - **Dark mode**: tema scuro per interfaccia, editor e anteprima (`Ctrl+Shift+D`);
   di default segue il tema di sistema.
 - **Auto-refresh**: se il file cambia su disco viene ricaricato automaticamente
@@ -58,16 +68,20 @@ MDV_NO_WEBENGINE=1 ./venv/bin/python mdv.py esempio.md
 | `F5` / `Ctrl+R`  | Ricarica dal disco              |
 | `Ctrl+W`         | Chiudi tab                      |
 | `Ctrl+Tab`       | Tab successiva / precedente     |
-| `Ctrl+Shift+L`   | Vista split on/off              |
+| `Ctrl+Shift+E`   | Mostra/nascondi la sorgente     |
+| `Ctrl+Shift+P`   | Mostra/nascondi l'anteprima     |
 | `Ctrl+Shift+D`   | Dark mode on/off                |
+| `Ctrl+,`         | Impostazioni                    |
 | `Ctrl+Q`         | Esci                            |
 
 ## Architettura
 
 Un unico file, `mdv.py`, organizzato in:
 
+- `ViewPrefs` + `load_prefs()`/`save_prefs()` — preferenze persistite con `QSettings`;
+- `SettingsDialog` — dialog *Impostazioni* (vista, font, colori, sintassi);
 - `build_html()` / `preview_css()` — conversione Markdown → HTML con CSS chiaro/scuro;
-- `MarkdownHighlighter` — evidenziazione sintattica della sorgente;
+- `MarkdownHighlighter` — evidenziazione sintattica della sorgente (attivabile);
 - `PreviewWidget` — anteprima con `QWebEngineView` (fallback `QTextBrowser`);
 - `MarkdownTab` — un file aperto: editor + anteprima + `QFileSystemWatcher` per l'auto-refresh;
-- `MainWindow` — tab, menu, temi, drag & drop.
+- `MainWindow` — tab, menu, riquadri indipendenti, temi, drag & drop.

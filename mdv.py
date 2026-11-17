@@ -4,10 +4,11 @@
 
 Funzionalità:
   * apertura di più file in tab dedicate
-  * vista split: sorgente Markdown a sinistra, anteprima a destra
+  * riquadri sorgente e anteprima mostrabili/nascosti in modo indipendente
   * dark mode (interfaccia + anteprima renderizzata)
   * auto-refresh quando il file cambia su disco
-  * evidenziazione sintattica della sorgente
+  * evidenziazione sintattica della sorgente (attivabile/disattivabile)
+  * Impostazioni: vista all'apertura, font, dimensioni e colori dei riquadri
   * salvataggio (Ctrl+S), trascinamento file nella finestra, scorciatoie
 
 Uso:
@@ -20,10 +21,12 @@ import html as html_lib
 import os
 import re
 import sys
+from dataclasses import dataclass
 
 import markdown
 from PyQt6.QtCore import (
     QFileSystemWatcher,
+    QSettings,
     Qt,
     QRegularExpression,
     QTimer,
@@ -45,12 +48,22 @@ from PyQt6.QtGui import (
 )
 from PyQt6.QtWidgets import (
     QApplication,
+    QCheckBox,
+    QColorDialog,
+    QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QFileDialog,
+    QFontComboBox,
     QFrame,
+    QGridLayout,
+    QGroupBox,
     QLabel,
     QMainWindow,
     QMessageBox,
+    QPushButton,
     QPlainTextEdit,
+    QSpinBox,
     QSplitter,
     QStackedWidget,
     QTabWidget,
@@ -78,6 +91,116 @@ MD_EXTENSIONS = ["extra", "toc", "sane_lists", "fenced_code", "codehilite", "pym
 MD_EXTENSION_CONFIGS = {
     "codehilite": {"guess_lang": False, "css_class": "highlight"},
 }
+
+# --------------------------------------------------------------------------- #
+#  Preferenze (persistite su disco con QSettings)
+# --------------------------------------------------------------------------- #
+
+DEFAULT_PREVIEW_SIZE = 15  # px, come nel CSS predefinito dell'anteprima
+
+
+@dataclass
+class ViewPrefs:
+    """Preferenze di visualizzazione dell'utente."""
+
+    mode: str = "split"        # split | preview | source (vista all'apertura)
+    src_family: str = ""       # "" = font monospazio di sistema
+    src_size: int = 0          # 0 = dimensione predefinita (px)
+    src_color: str = ""        # "" = colore del tema
+    src_syntax: bool = True    # colorazione della sintassi della sorgente
+    prev_family: str = ""      # "" = stack di font CSS predefinito
+    prev_size: int = DEFAULT_PREVIEW_SIZE
+    prev_color: str = ""       # "" = colore del tema
+
+
+def mode_to_panes(mode: str) -> tuple[bool, bool]:
+    """Converte la vista iniziale in (mostra_sorgente, mostra_anteprima)."""
+    if mode == "preview":
+        return False, True
+    if mode == "source":
+        return True, False
+    return True, True
+
+
+def panes_to_mode(show_source: bool, show_preview: bool) -> str:
+    """Ricava la vista iniziale dalla visibilità dei riquadri."""
+    if show_source and show_preview:
+        return "split"
+    if show_preview:
+        return "preview"
+    if show_source:
+        return "source"
+    return "split"  # non dovrebbe accadere: almeno un riquadro resta visibile
+
+
+def default_src_font() -> QFont:
+    """Font monospazio di sistema (valore predefinito della sorgente)."""
+    return QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont)
+
+
+def font_px(font: QFont) -> int:
+    """Dimensione del font in pixel (converte dai punti se necessario)."""
+    px = font.pixelSize()
+    if px and px > 0:
+        return px
+    pt = font.pointSizeF()
+    if pt and pt > 0:
+        screen = QApplication.primaryScreen()
+        dpi = screen.logicalDotsPerInchY() if screen else 96.0
+        return max(1, round(pt * dpi / 72))
+    return 11
+
+
+def default_prev_family() -> str:
+    """Famiglia rappresentativa del font di sistema (predefinito anteprima)."""
+    return QFontDatabase.systemFont(QFontDatabase.SystemFont.GeneralFont).family()
+
+
+def load_prefs() -> ViewPrefs:
+    """Legge le preferenze da disco, con i valori predefiniti mancanti."""
+    s = QSettings("mdv", "mdv")
+    p = ViewPrefs()
+
+    mode = s.value("view/mode", p.mode, type=str)
+    if mode in ("split", "preview", "source"):
+        p.mode = mode
+
+    p.src_family = s.value("source/font_family", "", type=str) or ""
+    p.src_color = s.value("source/font_color", "", type=str) or ""
+    p.src_syntax = s.value("source/syntax", True, type=bool)
+    p.prev_family = s.value("preview/font_family", "", type=str) or ""
+    p.prev_color = s.value("preview/font_color", "", type=str) or ""
+
+    try:
+        p.src_size = max(0, int(s.value("source/font_size", 0) or 0))
+    except (TypeError, ValueError):
+        p.src_size = 0
+    try:
+        p.prev_size = max(
+            0,
+            int(
+                s.value("preview/font_size", DEFAULT_PREVIEW_SIZE)
+                or DEFAULT_PREVIEW_SIZE
+            ),
+        )
+    except (TypeError, ValueError):
+        p.prev_size = DEFAULT_PREVIEW_SIZE
+
+    return p
+
+
+def save_prefs(prefs: ViewPrefs) -> None:
+    """Salva le preferenze su disco."""
+    s = QSettings("mdv", "mdv")
+    s.setValue("view/mode", prefs.mode)
+    s.setValue("source/font_family", prefs.src_family)
+    s.setValue("source/font_size", prefs.src_size)
+    s.setValue("source/font_color", prefs.src_color)
+    s.setValue("source/syntax", prefs.src_syntax)
+    s.setValue("preview/font_family", prefs.prev_family)
+    s.setValue("preview/font_size", prefs.prev_size)
+    s.setValue("preview/font_color", prefs.prev_color)
+    s.sync()
 
 _MONO = (
     'ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, '
@@ -180,8 +303,33 @@ def _highlight_overrides(dark: bool) -> str:
     return pre
 
 
-def preview_css(dark: bool) -> str:
-    """CSS dell'anteprima: tema + stili Pygments (se disponibili)."""
+def _css_quote(value: str) -> str:
+    """Valore CSS string-safe (nomi di font con apici)."""
+    return value.replace("\\", "\\\\").replace("'", "\\'")
+
+
+def _prefs_css(prefs: ViewPrefs | None) -> str:
+    """Override CSS per font e colori personalizzati dell'anteprima."""
+    if prefs is None:
+        return ""
+    rules: list[str] = []
+    if prefs.prev_family:
+        rules.append(f"body {{ font-family: '{_css_quote(prefs.prev_family)}'; }}")
+    if prefs.prev_size:
+        rules.append(f"body {{ font-size: {int(prefs.prev_size)}px; }}")
+    if prefs.prev_color:
+        # Il colore personalizzato vale per il testo; link e codice inline
+        # mantengono i loro colori di accento per restare distinguibili.
+        color = prefs.prev_color
+        rules.append(
+            "body, h1, h2, h3, h4, h5, h6, blockquote, pre code, td, th "
+            f"{{ color: {color}; }}"
+        )
+    return "\n".join(rules)
+
+
+def preview_css(dark: bool, prefs: ViewPrefs | None = None) -> str:
+    """CSS dell'anteprima: tema + stili Pygments + preferenze utente."""
     theme = DARK_PREVIEW_CSS if dark else LIGHT_PREVIEW_CSS
     try:
         from pygments.formatters import HtmlFormatter
@@ -191,17 +339,25 @@ def preview_css(dark: bool) -> str:
     except Exception:
         pyg = ""
     # Gli override devono venire dopo le regole di Pygments.
-    return theme + "\n" + pyg + "\n" + _highlight_overrides(dark)
+    return (
+        theme + "\n" + pyg + "\n" + _highlight_overrides(dark)
+        + "\n" + _prefs_css(prefs)
+    )
 
 
-def build_html(md_text: str, title: str, dark: bool) -> str:
+def build_html(
+    md_text: str,
+    title: str,
+    dark: bool,
+    prefs: ViewPrefs | None = None,
+) -> str:
     """Converte il testo Markdown in un documento HTML completo."""
     body = markdown.markdown(
         md_text,
         extensions=MD_EXTENSIONS,
         extension_configs=MD_EXTENSION_CONFIGS,
     )
-    css = preview_css(dark)
+    css = preview_css(dark, prefs)
     safe_title = html_lib.escape(title)
     return (
         "<!DOCTYPE html>\n"
@@ -224,16 +380,18 @@ def build_html(md_text: str, title: str, dark: bool) -> str:
 class MarkdownHighlighter(QSyntaxHighlighter):
     """Evidenziazione leggera per il testo Markdown."""
 
-    def __init__(self, document, dark: bool = False):
+    def __init__(self, document, dark: bool = False, custom_color: str = ""):
         super().__init__(document)
         self._dark = dark
+        self._custom = (custom_color or "").strip()
+        self._enabled = True
         self._fmt: dict[str, QTextCharFormat] = {}
         self._inline: list[tuple[QRegularExpression, QTextCharFormat]] = []
         self._build()
 
     # -- costruzione delle regole ------------------------------------------ #
     def _build(self) -> None:
-        mono = QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont).family()
+        mono = default_src_font().family()
 
         if self._dark:
             colors = dict(
@@ -261,6 +419,12 @@ class MarkdownHighlighter(QSyntaxHighlighter):
                 list_="#0550ae",
                 strike="#656d76",
             )
+
+        if self._custom:
+            # Con un colore personalizzato i token strutturali lo seguono;
+            # codice inline e link mantengono il colore di accento.
+            for key in ("heading", "strong", "em", "quote", "fence", "list_", "strike"):
+                colors[key] = self._custom
 
         def make(color=None, *, bold=False, italic=False, bg=None, family=None):
             f = QTextCharFormat()
@@ -312,8 +476,33 @@ class MarkdownHighlighter(QSyntaxHighlighter):
         self._build()
         self.rehighlight()
 
+    def set_custom_color(self, color: str) -> None:
+        """Imposta il colore personalizzato del testo ("" = colore del tema)."""
+        color = (color or "").strip()
+        if color == self._custom:
+            return
+        self._custom = color
+        self._build()
+        self.rehighlight()
+
+    def set_enabled(self, enabled: bool) -> None:
+        """Attiva/disattiva la colorazione della sintassi."""
+        if enabled == self._enabled:
+            return
+        self._enabled = enabled
+        self.rehighlight()
+
+    def is_enabled(self) -> bool:
+        return self._enabled
+
     # -- evidenziazione ----------------------------------------------------- #
     def highlightBlock(self, text: str) -> None:  # noqa: N802 (API Qt)
+        if not self._enabled:
+            # Nessun formato: il testo resta con lo stile di default
+            # (rehighlight() al riattivazione riformatta tutti i blocchi).
+            self.setCurrentBlockState(0)
+            return
+
         in_fence = self.previousBlockState() == 1
         stripped = text.strip()
 
@@ -419,18 +608,22 @@ class MarkdownTab(QWidget):
     notice = Signal(str)                 # messaggio per la barra di stato
     modified_changed = Signal(bool)      # stato "modificato" cambiato
 
-    def __init__(self, path: str, dark: bool = False, split: bool = True, parent=None):
+    def __init__(
+        self,
+        path: str,
+        dark: bool = False,
+        prefs: ViewPrefs | None = None,
+        parent=None,
+    ):
         super().__init__(parent)
         self.path = os.path.abspath(path)
         self._dark = dark
+        self._prefs = prefs if prefs is not None else ViewPrefs()
         self._loading = False
 
         # Sorgente
         self.editor = QPlainTextEdit()
         self.editor.setPlaceholderText("Sorgente Markdown…")
-        self.editor.setFont(
-            QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont)
-        )
 
         # Anteprima
         self.preview = PreviewWidget()
@@ -461,7 +654,7 @@ class MarkdownTab(QWidget):
         self.editor.document().modificationChanged.connect(self.modified_changed.emit)
 
         self.set_dark(dark)
-        self.set_split(split)
+        self.set_prefs(self._prefs)   # font, colori, sintassi, riquadri
         self.load()
         self.render()
         if os.path.isfile(self.path):
@@ -558,42 +751,76 @@ class MarkdownTab(QWidget):
     def render(self) -> None:
         self._render_timer.stop()
         html = build_html(
-            self.editor.toPlainText(), os.path.basename(self.path), self._dark
+            self.editor.toPlainText(),
+            os.path.basename(self.path),
+            self._dark,
+            self._prefs,
         )
         base = QUrl.fromLocalFile(os.path.dirname(self.path) + os.sep)
         self.preview.set_html(html, base)
 
-    # -- temi / layout ------------------------------------------------------ #
+    # -- temi / preferenze / layout ----------------------------------------- #
     def set_dark(self, dark: bool) -> None:
         self._dark = dark
-        pal = self.editor.palette()
-        if dark:
-            pal.setColor(QPalette.ColorRole.Base, QColor("#0d1117"))
-            pal.setColor(QPalette.ColorRole.Text, QColor("#e6edf3"))
-            pal.setColor(QPalette.ColorRole.PlaceholderText, QColor("#6e7681"))
-            pal.setColor(QPalette.ColorRole.Highlight, QColor("#1f6feb"))
-            pal.setColor(QPalette.ColorRole.HighlightedText, QColor("#ffffff"))
-        else:
-            pal.setColor(QPalette.ColorRole.Base, QColor("#ffffff"))
-            pal.setColor(QPalette.ColorRole.Text, QColor("#1f2328"))
-            pal.setColor(QPalette.ColorRole.PlaceholderText, QColor("#8b949e"))
-            pal.setColor(QPalette.ColorRole.Highlight, QColor("#0969da"))
-            pal.setColor(QPalette.ColorRole.HighlightedText, QColor("#ffffff"))
-        self.editor.setPalette(pal)
-
         if not hasattr(self, "_highlighter"):
-            self._highlighter = MarkdownHighlighter(self.editor.document(), dark)
+            self._highlighter = MarkdownHighlighter(
+                self.editor.document(), dark, self._prefs.src_color
+            )
+            self._highlighter.set_enabled(self._prefs.src_syntax)
         else:
             self._highlighter.set_dark(dark)
-
+        self._update_editor_palette()
         self.preview.set_dark(dark)
         self.render()
 
-    def set_split(self, visible: bool) -> None:
-        """Mostra/nasconde il pannello della sorgente (modalità lettura)."""
-        self.editor.setVisible(visible)
-        if visible:
+    def _update_editor_palette(self) -> None:
+        """Applica i colori di base della sorgente (tema o personalizzati)."""
+        if self._dark:
+            base_bg, placeholder = "#0d1117", "#6e7681"
+            highlight, theme_text = "#1f6feb", "#e6edf3"
+        else:
+            base_bg, placeholder = "#ffffff", "#8b949e"
+            highlight, theme_text = "#0969da", "#1f2328"
+        pal = self.editor.palette()
+        pal.setColor(QPalette.ColorRole.Base, QColor(base_bg))
+        pal.setColor(
+            QPalette.ColorRole.Text, QColor(self._prefs.src_color or theme_text)
+        )
+        pal.setColor(QPalette.ColorRole.PlaceholderText, QColor(placeholder))
+        pal.setColor(QPalette.ColorRole.Highlight, QColor(highlight))
+        pal.setColor(QPalette.ColorRole.HighlightedText, QColor("#ffffff"))
+        self.editor.setPalette(pal)
+
+    def set_prefs(self, prefs: ViewPrefs) -> None:
+        """Applica font, colori, sintassi e riquadri di sorgente/anteprima."""
+        self._prefs = prefs
+
+        # Font della sorgente (dimensioni in pixel)
+        default = default_src_font()
+        font = QFont(prefs.src_family or default.family())
+        font.setPixelSize(max(6, int(prefs.src_size or font_px(default))))
+        self.editor.setFont(font)
+
+        # Colore del testo e colorazione della sintassi
+        if hasattr(self, "_highlighter"):
+            self._highlighter.set_custom_color(prefs.src_color)
+            self._highlighter.set_enabled(prefs.src_syntax)
+        self._update_editor_palette()
+
+        # Riquadri (indipendenti l'uno dall'altro)
+        self.set_panes(*mode_to_panes(prefs.mode))
+
+        # L'anteprima dipende da font/colore via CSS
+        self.render()
+
+    def set_panes(self, show_source: bool, show_preview: bool) -> None:
+        """Mostra/nasconde i due riquadri in modo indipendente."""
+        self.editor.setVisible(show_source)
+        self.preview.setVisible(show_preview)
+        if show_source and show_preview:
             self.splitter.setSizes([500, 500])
+        elif show_source:
+            self.splitter.setSizes([1, 0])
         else:
             self.splitter.setSizes([0, 1])
 
@@ -654,11 +881,212 @@ def system_dark() -> bool:
         return False
 
 
+# --------------------------------------------------------------------------- #
+#  Dialog "Impostazioni"
+# --------------------------------------------------------------------------- #
+
+class SettingsDialog(QDialog):
+    """Vista all'apertura, font/colori dei due riquadri, sintassi della sorgente."""
+
+    def __init__(self, prefs: ViewPrefs, dark: bool, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Impostazioni")
+        self.setModal(True)
+        self.prefs = prefs  # aggiornato in accept()
+
+        # Valori predefiniti (quelli attuali dell'applicazione)
+        self._def_src_font = default_src_font()
+        self._def_src_px = font_px(self._def_src_font)
+        self._def_prev_family = default_prev_family()
+        self._def_color = QColor("#e6edf3" if dark else "#1f2328")
+
+        root = QVBoxLayout(self)
+
+        # --- Vista all'apertura -------------------------------------------- #
+        view_box = QGroupBox("Vista all'apertura dei file")
+        view_lay = QGridLayout(view_box)
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItem("Split view (sorgente + anteprima)", "split")
+        self.mode_combo.addItem("Solo anteprima formattata", "preview")
+        self.mode_combo.addItem("Solo sorgente", "source")
+        idx = self.mode_combo.findData(prefs.mode)
+        self.mode_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        view_lay.addWidget(QLabel("Vista predefinita:"), 0, 0)
+        view_lay.addWidget(self.mode_combo, 0, 1)
+        root.addWidget(view_box)
+
+        # --- Sorgente -------------------------------------------------------- #
+        src_box = QGroupBox("Sorgente (editor Markdown)")
+        src_lay = QGridLayout(src_box)
+
+        self.src_family = QFontComboBox()
+        self.src_family.setCurrentFont(
+            QFont(prefs.src_family or self._def_src_font.family())
+        )
+        self.src_size = QSpinBox()
+        self.src_size.setRange(6, 96)
+        self.src_size.setSuffix(" px")
+        self.src_size.setValue(prefs.src_size or self._def_src_px)
+
+        self.src_color_check = QCheckBox("Colore personalizzato")
+        self.src_color_check.setChecked(bool(prefs.src_color))
+        self.src_color = QColor(prefs.src_color or self._def_color)
+        self.src_color_btn = QPushButton()
+        self._swatch(self.src_color_btn, self.src_color)
+
+        self.src_syntax_check = QCheckBox("Colorazione della sintassi")
+        self.src_syntax_check.setChecked(prefs.src_syntax)
+        self.src_syntax_check.setToolTip(
+            "Evidenziazione di grassetti, titoli, codice, link, ecc."
+        )
+
+        src_lay.addWidget(QLabel("Font:"), 0, 0)
+        src_lay.addWidget(self.src_family, 0, 1)
+        src_lay.addWidget(QLabel("Dimensione:"), 1, 0)
+        src_lay.addWidget(self.src_size, 1, 1)
+        src_lay.addWidget(self.src_color_check, 2, 0)
+        src_lay.addWidget(self.src_color_btn, 2, 1, Qt.AlignmentFlag.AlignLeft)
+        src_lay.addWidget(self.src_syntax_check, 3, 0, 1, 2)
+        src_lay.setColumnStretch(1, 1)
+        root.addWidget(src_box)
+
+        # --- Anteprima -------------------------------------------------------- #
+        prev_box = QGroupBox("Anteprima (Markdown formattato)")
+        prev_lay = QGridLayout(prev_box)
+
+        self.prev_family = QFontComboBox()
+        self.prev_family.setCurrentFont(
+            QFont(prefs.prev_family or self._def_prev_family)
+        )
+        self.prev_size = QSpinBox()
+        self.prev_size.setRange(6, 96)
+        self.prev_size.setSuffix(" px")
+        self.prev_size.setValue(prefs.prev_size or DEFAULT_PREVIEW_SIZE)
+
+        self.prev_color_check = QCheckBox("Colore personalizzato")
+        self.prev_color_check.setChecked(bool(prefs.prev_color))
+        self.prev_color = QColor(prefs.prev_color or self._def_color)
+        self.prev_color_btn = QPushButton()
+        self._swatch(self.prev_color_btn, self.prev_color)
+
+        prev_lay.addWidget(QLabel("Font:"), 0, 0)
+        prev_lay.addWidget(self.prev_family, 0, 1)
+        prev_lay.addWidget(QLabel("Dimensione:"), 1, 0)
+        prev_lay.addWidget(self.prev_size, 1, 1)
+        prev_lay.addWidget(self.prev_color_check, 2, 0)
+        prev_lay.addWidget(self.prev_color_btn, 2, 1, Qt.AlignmentFlag.AlignLeft)
+        prev_lay.setColumnStretch(1, 1)
+        root.addWidget(prev_box)
+
+        note = QLabel(
+            "Il colore personalizzato vale per il testo: link e codice "
+            "mantengono il loro colore. Le modifiche si applicano subito e "
+            "vengono ricordate alla prossima apertura."
+        )
+        note.setWordWrap(True)
+        note.setStyleSheet("color: #656d76;")
+        root.addWidget(note)
+
+        # --- Pulsanti --------------------------------------------------------- #
+        self.button_box = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        btn_cancel = self.button_box.button(QDialogButtonBox.StandardButton.Cancel)
+        if btn_cancel is not None:
+            btn_cancel.setText("Annulla")
+        self.btn_reset = self.button_box.addButton(
+            "Ripristina predefiniti", QDialogButtonBox.ButtonRole.ActionRole
+        )
+        self.button_box.accepted.connect(self.accept)
+        self.button_box.rejected.connect(self.reject)
+        self.btn_reset.clicked.connect(self._reset_defaults)
+        root.addWidget(self.button_box)
+
+        # Abilitazione pulsanti colore
+        self.src_color_check.toggled.connect(self.src_color_btn.setEnabled)
+        self.prev_color_check.toggled.connect(self.prev_color_btn.setEnabled)
+        self.src_color_btn.setEnabled(self.src_color_check.isChecked())
+        self.prev_color_btn.setEnabled(self.prev_color_check.isChecked())
+        self.src_color_btn.clicked.connect(self._pick_src_color)
+        self.prev_color_btn.clicked.connect(self._pick_prev_color)
+
+        self.resize(500, self.sizeHint().height())
+
+    # -- helper -------------------------------------------------------------- #
+    @staticmethod
+    def _swatch(btn: QPushButton, color: QColor) -> None:
+        btn.setFixedSize(96, 24)
+        btn.setStyleSheet(
+            f"background-color: {color.name()}; "
+            "border: 1px solid #8a8f98; border-radius: 3px;"
+        )
+
+    def _pick_src_color(self) -> None:
+        color = QColorDialog.getColor(
+            self.src_color, self, "Colore del testo — sorgente"
+        )
+        if color.isValid():
+            self.src_color = color
+            self._swatch(self.src_color_btn, color)
+
+    def _pick_prev_color(self) -> None:
+        color = QColorDialog.getColor(
+            self.prev_color, self, "Colore del testo — anteprima"
+        )
+        if color.isValid():
+            self.prev_color = color
+            self._swatch(self.prev_color_btn, color)
+
+    def _reset_defaults(self) -> None:
+        """Riporta tutti i campi ai valori predefiniti."""
+        self.mode_combo.setCurrentIndex(0)  # split
+        self.src_family.setCurrentFont(QFont(self._def_src_font.family()))
+        self.src_size.setValue(self._def_src_px)
+        self.src_color_check.setChecked(False)
+        self.src_color = QColor(self._def_color)
+        self._swatch(self.src_color_btn, self.src_color)
+        self.src_syntax_check.setChecked(True)
+        self.prev_family.setCurrentFont(QFont(self._def_prev_family))
+        self.prev_size.setValue(DEFAULT_PREVIEW_SIZE)
+        self.prev_color_check.setChecked(False)
+        self.prev_color = QColor(self._def_color)
+        self._swatch(self.prev_color_btn, self.prev_color)
+
+    # -- raccolta dei valori ------------------------------------------------- #
+    def _collect(self) -> ViewPrefs:
+        src_family = self.src_family.currentFont().family()
+        if src_family == self._def_src_font.family():
+            src_family = ""  # resta il font di sistema predefinito
+        prev_family = self.prev_family.currentFont().family()
+        if prev_family == self._def_prev_family:
+            prev_family = ""  # resta lo stack CSS predefinito
+        return ViewPrefs(
+            mode=str(self.mode_combo.currentData()),
+            src_family=src_family,
+            src_size=int(self.src_size.value()),
+            src_color=self.src_color.name() if self.src_color_check.isChecked() else "",
+            src_syntax=self.src_syntax_check.isChecked(),
+            prev_family=prev_family,
+            prev_size=int(self.prev_size.value()),
+            prev_color=self.prev_color.name() if self.prev_color_check.isChecked() else "",
+        )
+
+    def accept(self) -> None:  # noqa: N802 (API Qt)
+        self.prefs = self._collect()
+        super().accept()
+
+
 class MainWindow(QMainWindow):
-    def __init__(self, dark: bool | None = None, split: bool = True):
+    def __init__(self, dark: bool | None = None, split: bool | None = None):
         super().__init__()
         self._dark = system_dark() if dark is None else dark
-        self._split = split
+
+        # Preferenze: la vista iniziale vale anche per i tab correnti
+        self.prefs = load_prefs()
+        if split is not None:  # sovrascritte per uso programmatico/test
+            self.prefs.mode = "split" if split else "preview"
+        self._show_source, self._show_preview = mode_to_panes(self.prefs.mode)
 
         self.resize(1180, 780)
         self.setAcceptDrops(True)
@@ -724,12 +1152,21 @@ class MainWindow(QMainWindow):
 
         view_menu = menubar.addMenu("&Visualizza")
 
-        self.act_split = QAction("&Vista split (sorgente + anteprima)", self)
-        self.act_split.setCheckable(True)
-        self.act_split.setChecked(self._split)
-        self.act_split.setShortcut(QKeySequence("Ctrl+Shift+L"))
-        self.act_split.toggled.connect(self._set_split)
-        view_menu.addAction(self.act_split)
+        self.act_show_source = QAction("Mostra &sorgente", self)
+        self.act_show_source.setCheckable(True)
+        self.act_show_source.setChecked(self._show_source)
+        self.act_show_source.setShortcut(QKeySequence("Ctrl+Shift+E"))
+        self.act_show_source.toggled.connect(lambda v: self._set_pane("source", v))
+        view_menu.addAction(self.act_show_source)
+
+        self.act_show_preview = QAction("Mostra &anteprima", self)
+        self.act_show_preview.setCheckable(True)
+        self.act_show_preview.setChecked(self._show_preview)
+        self.act_show_preview.setShortcut(QKeySequence("Ctrl+Shift+P"))
+        self.act_show_preview.toggled.connect(lambda v: self._set_pane("preview", v))
+        view_menu.addAction(self.act_show_preview)
+
+        view_menu.addSeparator()
 
         self.act_dark = QAction("&Dark mode", self)
         self.act_dark.setCheckable(True)
@@ -758,6 +1195,12 @@ class MainWindow(QMainWindow):
         )
         view_menu.addAction(self.act_prev)
 
+        settings_menu = menubar.addMenu("&Impostazioni")
+        self.act_settings = QAction("&Preferenze…", self)
+        self.act_settings.setShortcut(QKeySequence("Ctrl+,"))
+        self.act_settings.triggered.connect(self.open_settings)
+        settings_menu.addAction(self.act_settings)
+
         help_menu = menubar.addMenu("&Aiuto")
         act_about = QAction("&Informazioni su mdv", self)
         act_about.triggered.connect(self._about)
@@ -784,7 +1227,7 @@ class MainWindow(QMainWindow):
                 self._tabs.setCurrentIndex(i)
                 return tab
 
-        tab = MarkdownTab(path, dark=self._dark, split=self._split)
+        tab = MarkdownTab(path, dark=self._dark, prefs=self.prefs)
         tab.notice.connect(lambda msg: self.statusBar().showMessage(msg, 6000))
         tab.modified_changed.connect(
             lambda _mod, t=tab: self._on_modified(t)
@@ -885,12 +1328,59 @@ class MainWindow(QMainWindow):
             if isinstance(tab, MarkdownTab):
                 tab.set_dark(dark)
 
-    def _set_split(self, split: bool) -> None:
-        self._split = split
+    # -- preferenze e riquadri ---------------------------------------------- #
+    def open_settings(self) -> None:
+        """Apre il dialog Impostazioni e applica i valori confermati."""
+        dlg = SettingsDialog(self.prefs, self._dark, self)
+        if dlg.exec():
+            self.apply_prefs(dlg.prefs)
+
+    def apply_prefs(self, prefs: ViewPrefs) -> None:
+        """Applica e salva le preferenze su tutti i tab aperti."""
+        self.prefs = prefs
+        save_prefs(self.prefs)
+        self._show_source, self._show_preview = mode_to_panes(prefs.mode)
+        self._sync_pane_actions()
         for i in range(self._tabs.count()):
             tab = self._tabs.widget(i)
             if isinstance(tab, MarkdownTab):
-                tab.set_split(split)
+                tab.set_prefs(self.prefs)
+        self.statusBar().showMessage("Impostazioni applicate e salvate", 4000)
+
+    def _set_pane(self, which: str, visible: bool) -> None:
+        """Mostra/nasconde un riquadro in modo indipendente dall'altro."""
+        show_source = visible if which == "source" else self._show_source
+        show_preview = visible if which == "preview" else self._show_preview
+
+        if not show_source and not show_preview:
+            self.statusBar().showMessage(
+                "Almeno un riquadro deve restare visibile", 4000
+            )
+            self._sync_pane_actions()
+            return
+
+        self._show_source, self._show_preview = show_source, show_preview
+        self.prefs.mode = panes_to_mode(show_source, show_preview)
+        save_prefs(self.prefs)
+        self._sync_pane_actions()
+        self._apply_panes()
+
+    def _sync_pane_actions(self) -> None:
+        """Allinea le voci di menu allo stato reale dei riquadri."""
+        for act, value in (
+            (self.act_show_source, self._show_source),
+            (self.act_show_preview, self._show_preview),
+        ):
+            if act.isChecked() != value:
+                act.blockSignals(True)
+                act.setChecked(value)
+                act.blockSignals(False)
+
+    def _apply_panes(self) -> None:
+        for i in range(self._tabs.count()):
+            tab = self._tabs.widget(i)
+            if isinstance(tab, MarkdownTab):
+                tab.set_panes(self._show_source, self._show_preview)
 
     def _about(self) -> None:
         engine = "QWebEngineView" if HAVE_WEBENGINE else "QTextBrowser (fallback)"
@@ -898,7 +1388,10 @@ class MainWindow(QMainWindow):
             self, "Informazioni su mdv",
             "<b>mdv</b> — reader GUI per file Markdown<br><br>"
             "• più file in tab dedicate<br>"
-            "• vista split sorgente + anteprima (Ctrl+Shift+L)<br>"
+            "• riquadri sorgente/anteprima indipendenti "
+            "(Ctrl+Shift+E / Ctrl+Shift+P)<br>"
+            "• Impostazioni: vista all'apertura, font, colori, sintassi "
+            "(Ctrl+,)<br>"
             "• dark mode (Ctrl+Shift+D)<br>"
             "• auto-refresh al cambio su disco (F5 per ricaricare)<br>"
             "• salvataggio con Ctrl+S, apertura con Ctrl+O<br><br>"
