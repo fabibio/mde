@@ -8,12 +8,28 @@ Reader GUI per file Markdown con visualizzazione a **tab**, scritto in Python co
 - **Due riquadri indipendenti**: sorgente Markdown e anteprima formattata si
   mostrano/nascondono singolarmente dal menu *Visualizza* (`Ctrl+Shift+E` /
   `Ctrl+Shift+P`); almeno un riquadro resta sempre visibile.
+- **Menu *File***:
+  - **Nuovo** (`Ctrl+N`): apre un file "Senza titolo", il percorso viene chiesto
+    al primo salvataggio;
+  - **Apri recenti**: ultimi 10 file aperti, in ordine di utilizzo;
+  - **Salva con nome…** (`Ctrl+Shift+S`), con estensione `.md` aggiunta se mancante.
+- **Menu *Modifica***: annulla/riprendi, taglia/copia/incolla e **cerca/sostituisci**
+  con barra stile Kate/KWrite: campo *Trova*, opzioni (maiuscole/minuscole,
+  parola intera, regex), frecce, contatore e campo *Sostituisci*;
+  evidenziazione live dei risultati, `Enter`/`Shift+Enter` per scorrere,
+  `Esc` per chiudere.
+- **Menu *Selezione***: **riformattazione ASCII delle tabelle** (`Ctrl+Alt+T`):
+  allinea le colonne della tabella sotto il cursore (o della selezione) secondo
+  gli allineamenti dichiarati; le righe che superano la **larghezza massima**
+  configurata restano inalterate, così come le righe che non ci starebbero mai.
 - **Menu *Impostazioni*** (`Ctrl+,`), con valori predefiniti pari al comportamento
   attuale e persistiti su disco (`~/.config/mdv/mdv.conf`):
   - **vista all'apertura**: split view, solo anteprima formattata o solo sorgente;
   - **font e dimensioni** per ciascun dei due riquadri;
   - **colore del testo** per ciascun riquadro (default: colore del tema);
-  - **colorazione della sintassi** della sorgente, attivabile/disattivabile.
+  - **colorazione della sintassi** della sorgente, attivabile/disattivabile;
+  - **larghezza massima riga di tabella** (default 80 caratteri, 40–400)
+    usata dalla riformattazione ASCII.
   Le modifiche si applicano subito a tutti i file aperti e vengono ricordate
   alla prossima apertura; un pulsante *Ripristina predefiniti* riporta tutto
   al valore iniziale.
@@ -63,11 +79,20 @@ MDV_NO_WEBENGINE=1 ./venv/bin/python mdv.py esempio.md
 
 | Tasto            | Azione                          |
 |------------------|---------------------------------|
+| `Ctrl+N`         | Nuovo file                      |
 | `Ctrl+O`         | Apri file                       |
+| `Ctrl+Shift+S`   | Salva con nome                  |
 | `Ctrl+S`         | Salva                           |
 | `F5` / `Ctrl+R`  | Ricarica dal disco              |
 | `Ctrl+W`         | Chiudi tab                      |
 | `Ctrl+Tab`       | Tab successiva / precedente     |
+| `Ctrl+Z`         | Annulla                         |
+| `Ctrl+Shift+Z` / `Ctrl+Y` | Ripeti                  |
+| `Ctrl+X` / `Ctrl+C` / `Ctrl+V` | Taglia / Copia / Incolla |
+| `Ctrl+F`         | Cerca (barra stile Kate)        |
+| `Ctrl+H`         | Cerca e sostituisci             |
+| `F3` / `Shift+F3`| Risultato successivo/precedente |
+| `Ctrl+Alt+T`     | Riformatta la tabella ASCII     |
 | `Ctrl+Shift+E`   | Mostra/nascondi la sorgente     |
 | `Ctrl+Shift+P`   | Mostra/nascondi l'anteprima     |
 | `Ctrl+Shift+D`   | Dark mode on/off                |
@@ -79,9 +104,13 @@ MDV_NO_WEBENGINE=1 ./venv/bin/python mdv.py esempio.md
 Un unico file, `mdv.py`, organizzato in:
 
 - `ViewPrefs` + `load_prefs()`/`save_prefs()` — preferenze persistite con `QSettings`;
-- `SettingsDialog` — dialog *Impostazioni* (vista, font, colori, sintassi);
+- `SettingsDialog` — dialog *Impostazioni* (vista, font, colori, sintassi, tabelle);
 - `build_html()` / `preview_css()` — conversione Markdown → HTML con CSS chiaro/scuro;
+- `format_table()` + `find_table_block()` — riformattazione ASCII delle tabelle
+  (funzioni pure, testabili senza GUI);
 - `MarkdownHighlighter` — evidenziazione sintattica della sorgente (attivabile);
+- `FindReplaceBar` — barra trova/sostituisci con evidenziazione live;
 - `PreviewWidget` — anteprima con `QWebEngineView` (fallback `QTextBrowser`);
 - `MarkdownTab` — un file aperto: editor + anteprima + `QFileSystemWatcher` per l'auto-refresh;
-- `MainWindow` — tab, menu, riquadri indipendenti, temi, drag & drop.
+- `MainWindow` — tab, menu (File/Modifica/Visualizza/Selezione/Impostazioni/Aiuto),
+  file recenti, riquadri indipendenti, temi, drag & drop.

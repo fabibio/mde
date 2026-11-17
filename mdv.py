@@ -3,13 +3,18 @@
 """mdv — reader GUI per file Markdown.
 
 Funzionalità:
-  * apertura di più file in tab dedicate
+  * apertura di più file in tab dedicate, file nuovi e aperti di recente
   * riquadri sorgente e anteprima mostrabili/nascosti in modo indipendente
   * dark mode (interfaccia + anteprima renderizzata)
   * auto-refresh quando il file cambia su disco
   * evidenziazione sintattica della sorgente (attivabile/disattivabile)
-  * Impostazioni: vista all'apertura, font, dimensioni e colori dei riquadri
-  * salvataggio (Ctrl+S), trascinamento file nella finestra, scorciatoie
+  * menu Modifica: annulla/riprendi, taglia/copia/incolla, cerca e
+    sostituisci con barra stile Kate (Ctrl+F / Ctrl+H, F3 / Shift+F3)
+  * menu Selezione: riformattazione ASCII delle tabelle selezionate
+  * Impostazioni: vista all'apertura, font, dimensioni e colori dei riquadri,
+    colorazione sintassi, larghezza massima delle righe di tabella
+  * salvataggio (Ctrl+S) e salva con nome (Ctrl+Shift+S), drag & drop,
+    scorciatoie
 
 Uso:
     python mdv.py [file.md ...] [--dark|--light] [--no-webengine]
@@ -21,10 +26,12 @@ import html as html_lib
 import os
 import re
 import sys
+import unicodedata
 from dataclasses import dataclass
 
 import markdown
 from PyQt6.QtCore import (
+    QEvent,
     QFileSystemWatcher,
     QSettings,
     Qt,
@@ -43,8 +50,10 @@ from PyQt6.QtGui import (
     QFontDatabase,
     QKeySequence,
     QPalette,
+    QShortcut,
     QSyntaxHighlighter,
     QTextCharFormat,
+    QTextCursor,
 )
 from PyQt6.QtWidgets import (
     QApplication,
@@ -58,7 +67,9 @@ from PyQt6.QtWidgets import (
     QFrame,
     QGridLayout,
     QGroupBox,
+    QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QMessageBox,
     QPushButton,
@@ -68,6 +79,8 @@ from PyQt6.QtWidgets import (
     QStackedWidget,
     QTabWidget,
     QTextBrowser,
+    QTextEdit,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -97,6 +110,8 @@ MD_EXTENSION_CONFIGS = {
 # --------------------------------------------------------------------------- #
 
 DEFAULT_PREVIEW_SIZE = 15  # px, come nel CSS predefinito dell'anteprima
+DEFAULT_TABLE_MAX_WIDTH = 80  # caratteri: righe di tabella più lunghe restano inalterate
+TABLE_MIN_COL_WIDTH = 3      # minima larghezza di una colonna (serve per "---")
 
 
 @dataclass
@@ -111,6 +126,7 @@ class ViewPrefs:
     prev_family: str = ""      # "" = stack di font CSS predefinito
     prev_size: int = DEFAULT_PREVIEW_SIZE
     prev_color: str = ""       # "" = colore del tema
+    table_max_width: int = DEFAULT_TABLE_MAX_WIDTH  # larghezza max riga tabella
 
 
 def mode_to_panes(mode: str) -> tuple[bool, bool]:
@@ -185,6 +201,18 @@ def load_prefs() -> ViewPrefs:
         )
     except (TypeError, ValueError):
         p.prev_size = DEFAULT_PREVIEW_SIZE
+    try:
+        p.table_max_width = max(
+            40,
+            int(
+                s.value(
+                    "edit/table_max_width", DEFAULT_TABLE_MAX_WIDTH
+                )
+                or DEFAULT_TABLE_MAX_WIDTH
+            ),
+        )
+    except (TypeError, ValueError):
+        p.table_max_width = DEFAULT_TABLE_MAX_WIDTH
 
     return p
 
@@ -200,7 +228,350 @@ def save_prefs(prefs: ViewPrefs) -> None:
     s.setValue("preview/font_family", prefs.prev_family)
     s.setValue("preview/font_size", prefs.prev_size)
     s.setValue("preview/font_color", prefs.prev_color)
+    s.setValue("edit/table_max_width", prefs.table_max_width)
     s.sync()
+
+
+# --------------------------------------------------------------------------- #
+#  Riformattazione tabelle ASCII (menu Selezione)
+# --------------------------------------------------------------------------- #
+
+def display_width(text: str) -> int:
+    """Larghezza a video: i caratteri larghi (W/F) valgono 2, gli accentati 0."""
+    width = 0
+    for ch in text:
+        if unicodedata.combining(ch):
+            continue
+        width += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+    return width
+
+
+def _has_unescaped_pipe(text: str) -> bool:
+    """True se la stringa contiene una '|' non preceduta da backslash."""
+    i, n = 0, len(text)
+    while i < n:
+        if text[i] == "\\":
+            i += 2
+            continue
+        if text[i] == "|":
+            return True
+        i += 1
+    return False
+
+
+def _ends_with_unescaped_pipe(text: str) -> bool:
+    """True se la stringa termina con una '|' non escape-ata."""
+    if not text.endswith("|"):
+        return False
+    backslashes, i = 0, len(text) - 2
+    while i >= 0 and text[i] == "\\":
+        backslashes += 1
+        i -= 1
+    return backslashes % 2 == 0
+
+
+def _split_cells(body: str) -> list[str]:
+    """Divide il corpo di una riga sulle '|' non escape-ate ('\\|' resta testo)."""
+    cells: list[str] = []
+    cur: list[str] = []
+    i, n = 0, len(body)
+    while i < n:
+        ch = body[i]
+        if ch == "\\" and i + 1 < n:
+            cur.append(body[i : i + 2])
+            i += 2
+            continue
+        if ch == "|":
+            cells.append("".join(cur))
+            cur = []
+        else:
+            cur.append(ch)
+        i += 1
+    cells.append("".join(cur))
+    return cells
+
+
+def _parse_row(line: str) -> tuple[str, list[str] | None]:
+    """Separa prefisso (indentazione / '>') e celle di una riga.
+
+    Ritorna (prefisso, celle); celle è None se la riga non contiene '|'.
+    """
+    expanded = line.expandtabs(4)
+    m = re.match(r"[\s>]*", expanded)
+    prefix = m.group(0) if m else ""
+    body = expanded[len(prefix):]
+    if not _has_unescaped_pipe(body):
+        return prefix, None
+    cells = _split_cells(body)
+    if body[:1] == "|":          # bordo iniziale -> cella fantasma
+        cells = cells[1:]
+    if _ends_with_unescaped_pipe(body) and cells:  # bordo finale
+        cells = cells[:-1]
+    return prefix, cells
+
+
+_DELIM_CELL_RE = re.compile(r"\s*:?-+:?\s*")
+
+
+def _is_table_delimiter(cells: list[str]) -> bool:
+    """True se tutte le celle sono del tipo '---', ':---', '---:' o ':---:'."""
+    return bool(cells) and all(_DELIM_CELL_RE.fullmatch(c) for c in cells)
+
+
+def _delimiter_alignment(cell: str) -> str | None:
+    """Allineamento dichiarato dalla cella di delimitazione."""
+    text = cell.strip()
+    left = text.startswith(":")
+    right = text.endswith(":")
+    if left and right:
+        return "center"
+    if left:
+        return "left"
+    if right:
+        return "right"
+    return None
+
+
+def is_inside_fence(lines: list[str], index: int) -> bool:
+    """True se la riga `index` cade dentro un blocco fenced code (``` o ~~~)."""
+    if index < 0 or index >= len(lines):
+        return False
+    char, length = "", 0
+    for line in lines[: index + 1]:
+        m = re.match(r" {0,3}(`{3,}|~{3,})", line)
+        if not m:
+            continue
+        marker = m.group(1)
+        if not char:
+            # Per i fence con '`' l'info string non può contenere '`'.
+            if marker[0] == "`" and "`" in line[m.end():]:
+                continue
+            char, length = marker[0], len(marker)
+        elif marker[0] == char and len(marker) >= length and not line[m.end():].strip():
+            char, length = "", 0  # chiusura
+    return bool(char)
+
+
+def find_table_block(
+    lines: list[str], start: int, end: int | None = None
+) -> tuple[int, int, str | None]:
+    """Individua il blocco di tabella attorno al cursore o alla selezione.
+
+    Ritorna (prima_riga, ultima_riga, errore): le righe contigue con '|'
+    che partono da `start` (o dall'intervallo start..end), rifiutando i
+    blocchi di codice fenced.
+    """
+    if not lines:
+        return 0, 0, "documento vuoto"
+    if end is None or end < start:
+        end = start
+    start = max(0, min(start, len(lines) - 1))
+    end = max(start, min(end, len(lines) - 1))
+
+    if is_inside_fence(lines, start) or is_inside_fence(lines, end):
+        return start, end, "il cursore è dentro un blocco di codice"
+    if not _has_unescaped_pipe(lines[start].expandtabs(4)):
+        return start, end, "il cursore non è su una riga di tabella"
+
+    first = start
+    while first > 0 and _has_unescaped_pipe(lines[first - 1].expandtabs(4)):
+        first -= 1
+    last = end
+    while (
+        last + 1 < len(lines)
+        and _has_unescaped_pipe(lines[last + 1].expandtabs(4))
+    ):
+        last += 1
+    for i in range(first, last + 1):
+        if is_inside_fence(lines, i):
+            return first, last, "il blocco selezionato contiene codice fenced"
+
+    # I parser richiedono l'intestazione come prima riga del blocco: se ci
+    # sono righe con '|' sopra, il blocco inizia alla riga sopra il delimiter.
+    delim = next(
+        (
+            i
+            for i in range(first, last + 1)
+            if (c := _parse_row(lines[i])[1]) is not None
+            and _is_table_delimiter(c)
+        ),
+        None,
+    )
+    if delim is not None and delim - 1 > first:
+        first = delim - 1
+    return first, last, None
+
+
+def _pad_cell(content: str, width: int, align: str | None) -> str:
+    pad = max(0, width - display_width(content))
+    if align == "right":
+        return " " * pad + content
+    if align == "center":
+        left = pad // 2
+        return " " * left + content + " " * (pad - left)
+    return content + " " * pad
+
+
+def _render_row(
+    prefix: str, cells: list[str], widths: list[int], aligns: list[str | None]
+) -> str:
+    parts = []
+    for j, width in enumerate(widths):
+        content = cells[j].strip() if j < len(cells) else ""
+        parts.append(" " + _pad_cell(content, width, aligns[j]) + " ")
+    return prefix + "|" + "|".join(parts) + "|"
+
+
+def _render_delimiter(
+    prefix: str, widths: list[int], aligns: list[str | None]
+) -> str:
+    parts = []
+    for width, align in zip(widths, aligns):
+        if align == "left":
+            text = ":" + "-" * (width - 1)
+        elif align == "right":
+            text = "-" * (width - 1) + ":"
+        elif align == "center":
+            text = ":" + "-" * (width - 2) + ":"
+        else:
+            text = "-" * width
+        parts.append(" " + text + " ")
+    return prefix + "|" + "|".join(parts) + "|"
+
+
+def format_table(
+    lines: list[str], max_width: int
+) -> tuple[list[str], str | None]:
+    """Riformatta un blocco di tabella Markdown allineando le colonne in ASCII.
+
+    Ritorna (righe, messaggio): `messaggio` è None a formattazione avvenuta,
+    altrimenti le righe sono quelle originali e il messaggio spiega il motivo.
+
+    Corner case gestiti:
+      * righe la cui resa supererebbe `max_width` restano inalterate
+        (prima quelle che non ci starebbero mai, poi — in modo iterativo —
+        quelle che allargano troppo le colonne per tutte le altre);
+      * celle mancanti (riga corta) vengono integrate, celle in eccesso
+        rispetto alla delimitazione lasciano la riga invariata;
+      * '|'-escape-ate ("\\|") non separano le celle;
+      * tab espansi a 4 spazi, prefissi '> '/indentazione conservati e
+        riattaccati allineati;
+      * intestazione o delimitazione mancanti/non corrispondenti -> errore;
+      * blocchi dentro fenced code -> rifiutati (vedi find_table_block).
+    """
+    original = list(lines)
+    if not lines:
+        return original, "nessuna tabella da formattare"
+    if max_width < 6:
+        return original, "larghezza massima troppo piccola"
+
+    parsed = [_parse_row(line) for line in lines]
+
+    delim_idx = next(
+        (
+            i
+            for i, (_prefix, cells) in enumerate(parsed)
+            if cells is not None and _is_table_delimiter(cells)
+        ),
+        -1,
+    )
+    if delim_idx < 0:
+        return original, "manca la riga di delimitazione (es. |---|---|)"
+    if delim_idx == 0:
+        return original, "manca la riga di intestazione sopra la delimitazione"
+
+    delim_cells = parsed[delim_idx][1] or []
+    ncols = len(delim_cells)
+    aligns = [_delimiter_alignment(c) for c in delim_cells]
+
+    header_cells = parsed[delim_idx - 1][1]
+    if header_cells is None or len(header_cells) != ncols:
+        return original, "l'intestazione non corrisponde alla riga di delimitazione"
+
+    # Righe renderabili: intestazione, delimitazione e corpo con <= ncols celle.
+    renderable = {delim_idx - 1, delim_idx}
+    for i in range(delim_idx + 1, len(parsed)):
+        cells = parsed[i][1]
+        if cells and len(cells) <= ncols:
+            renderable.add(i)
+
+    def widths_over(indices: set[int]) -> list[int]:
+        """Larghezze di colonna (min 3) dati gli indici delle righe ammesse."""
+        widths = [TABLE_MIN_COL_WIDTH] * ncols
+        for i in indices:
+            if i == delim_idx:
+                continue  # la delimitazione viene rigenerata: non conta
+            cells = parsed[i][1] or []
+            for j in range(ncols):
+                content = cells[j].strip() if j < len(cells) else ""
+                w = display_width(content)
+                if w > widths[j]:
+                    widths[j] = w
+        return widths
+
+    def fits(widths: list[int]) -> bool:
+        # Tutte le righe renderabili hanno la stessa larghezza finale:
+        # ncols celle + (ncols + 1) barre + 2 spazi per cella.
+        return sum(widths) + 3 * ncols + 1 <= max_width
+
+    def own_fits(i: int) -> bool:
+        """True se la riga ci starebbe anche da sola (colonne al minimo)."""
+        cells = parsed[i][1] or []
+        widths = [TABLE_MIN_COL_WIDTH] * ncols
+        for j in range(ncols):
+            content = cells[j].strip() if j < len(cells) else ""
+            widths[j] = max(widths[j], display_width(content))
+        return fits(widths)
+
+    # 1) Righe "impossibili": non ci starebbero mai -> inalterate subito.
+    excluded = {
+        i
+        for i in renderable
+        if i != delim_idx and not own_fits(i)
+    }
+
+    # 2) Se il totale supera il limite, togliere la riga che contribuisce
+    #    di più finché non entra (in modo monotono: mai rientri).
+    widths = widths_over(renderable - excluded)
+    while not fits(widths):
+        best, best_key = None, (0, -1)
+        for i in sorted(renderable - excluded - {delim_idx}):
+            gain = sum(widths) - sum(
+                widths_over(renderable - excluded - {i})
+            )
+            # Preferenza alle righe di corpo (indice più alto) a parità di gain.
+            key = (gain, i)
+            if gain > 0 and key > best_key:
+                best, best_key = i, key
+        if best is None:
+            break
+        excluded.add(best)
+        widths = widths_over(renderable - excluded)
+
+    if not fits(widths):
+        return original, (
+            f"la tabella supera la larghezza massima di {max_width} caratteri"
+        )
+
+    # Prefissi (indentazione / '>') allineati sulla stessa colonna.
+    rendered = renderable - excluded
+    max_prefix = max(
+        (display_width(parsed[i][0]) for i in rendered), default=0
+    )
+
+    out: list[str] = []
+    for i, line in enumerate(original):
+        if i not in rendered:
+            out.append(line)  # invariata (fuori tabella, non allineabile, esclusa)
+            continue
+        prefix, cells = parsed[i]
+        prefix = prefix + " " * (max_prefix - display_width(prefix))
+        if i == delim_idx:
+            out.append(_render_delimiter(prefix, widths, aligns))
+        else:
+            out.append(_render_row(prefix, cells or [], widths, aligns))
+    return out, None
+
 
 _MONO = (
     'ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, '
@@ -599,6 +970,322 @@ class PreviewWidget(QWidget):
 
 
 # --------------------------------------------------------------------------- #
+#  Barra "Trova/Sostituisci" (stile Kate/KWrite)
+# --------------------------------------------------------------------------- #
+
+MATCH_COLOR = "#b5d6ff"      # evidenziazione dei risultati
+CURRENT_COLOR = "#ffcc66"    # risultato corrente (selezione nell'editor)
+
+
+class _FindLineEdit(QLineEdit):
+    """Campo che distingue Return (successivo) da Shift+Return (precedente)."""
+
+    submitted = Signal(bool)  # True se Shift era premuto
+
+    def keyPressEvent(self, event) -> None:  # noqa: N802 (API Qt)
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            self.submitted.emit(
+                bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
+            )
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+
+class FindReplaceBar(QWidget):
+    """Barra di ricerca/sostituzione con evidenziazione live dei match.
+
+    Layout stile Kate/KWrite: riga "Trova" con opzioni (maiuscole/minuscole,
+    parola intera, regex), frecce per scorrere, contatore e chiusura; riga
+    "Sostituisci" con i pulsanti di sostituzione.
+    """
+
+    notice = Signal(str)  # messaggi per la barra di stato
+    closed = Signal()     # l'utente ha chiuso la barra (Esc o ✕)
+
+    def __init__(self, editor: QPlainTextEdit, parent=None):
+        super().__init__(parent)
+        self.editor = editor
+        self._matches: list[tuple[int, int]] = []
+        self._last_error = ""
+
+        # --- campi --------------------------------------------------------- #
+        self.find_edit = _FindLineEdit()
+        self.find_edit.setPlaceholderText("Trova…")
+        self.replace_edit = QLineEdit()
+        self.replace_edit.setPlaceholderText("Sostituisci con…")
+
+        # --- opzioni ------------------------------------------------------- #
+        self.opt_case = QToolButton()
+        self.opt_case.setText("Aa")
+        self.opt_case.setCheckable(True)
+        self.opt_case.setToolTip("Distingui maiuscole/minuscole")
+        self.opt_word = QToolButton()
+        self.opt_word.setText("ab|")
+        self.opt_word.setCheckable(True)
+        self.opt_word.setToolTip("Solo parole intere")
+        self.opt_regex = QToolButton()
+        self.opt_regex.setText(".*")
+        self.opt_regex.setCheckable(True)
+        self.opt_regex.setToolTip("Espressione regolare")
+        for opt in (self.opt_case, self.opt_word, self.opt_regex):
+            opt.setAutoRaise(True)
+            opt.setFixedWidth(28)
+
+        # --- navigazione ---------------------------------------------------- #
+        self.btn_prev = QToolButton()
+        self.btn_prev.setText("↑")
+        self.btn_prev.setToolTip("Risultato precedente (Shift+Enter)")
+        self.btn_next = QToolButton()
+        self.btn_next.setText("↓")
+        self.btn_next.setToolTip("Risultato successivo (Enter)")
+        self.btn_close = QToolButton()
+        self.btn_close.setText("✕")
+        self.btn_close.setToolTip("Chiudi la barra (Esc)")
+        self.lbl_count = QLabel()
+
+        self.btn_replace = QPushButton("Sostituisci")
+        self.btn_replace_all = QPushButton("Tutti")
+
+        # --- layout ---------------------------------------------------------- #
+        row1 = QHBoxLayout()
+        row1.setSpacing(4)
+        row1.addWidget(QLabel("Trova:"))
+        row1.addWidget(self.find_edit, 1)
+        for widget in (
+            self.opt_case, self.opt_word, self.opt_regex,
+            self.btn_prev, self.btn_next, self.lbl_count, self.btn_close,
+        ):
+            row1.addWidget(widget)
+
+        row2 = QHBoxLayout()
+        row2.setSpacing(4)
+        row2.addWidget(QLabel("Sostituisci:"))
+        row2.addWidget(self.replace_edit, 1)
+        row2.addWidget(self.btn_replace)
+        row2.addWidget(self.btn_replace_all)
+        self._replace_row = QWidget()
+        self._replace_row.setLayout(row2)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(6, 4, 6, 4)
+        lay.setSpacing(4)
+        lay.addLayout(row1)
+        lay.addWidget(self._replace_row)
+
+        self.setStyleSheet(
+            "QToolButton:checked { background-color: #b5d6ff; color: #1f2328; "
+            "border: 1px solid #4a90d9; border-radius: 3px; }"
+        )
+
+        # --- segnali ---------------------------------------------------------- #
+        self.find_edit.submitted.connect(
+            lambda shift: self.find_next(backwards=bool(shift))
+        )
+        self.find_edit.textChanged.connect(self.refresh)
+        for opt in (self.opt_case, self.opt_word, self.opt_regex):
+            opt.toggled.connect(self.refresh)
+        self.btn_prev.clicked.connect(lambda: self.find_next(backwards=True))
+        self.btn_next.clicked.connect(lambda: self.find_next())
+        self.btn_close.clicked.connect(self.close_bar)
+        self.btn_replace.clicked.connect(self.replace_current)
+        self.btn_replace_all.clicked.connect(self.replace_all)
+        self.replace_edit.returnPressed.connect(self.replace_current)
+
+        esc = QShortcut(QKeySequence(Qt.Key.Key_Escape), self)
+        esc.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        esc.activated.connect(self.close_bar)
+
+        self.editor.textChanged.connect(self.refresh)
+        self.editor.cursorPositionChanged.connect(self._repaint)
+
+        self._replace_row.hide()
+        self.hide()
+
+    # -- apertura / chiusura ------------------------------------------------- #
+    def show_bar(self, replace: bool = False, initial: str | None = None) -> None:
+        """Mostra la barra (con la riga di sostituzione se richiesta)."""
+        if initial and "\n" not in initial:
+            self.find_edit.setText(initial)
+        self._replace_row.setVisible(replace)
+        self.show()
+        self.refresh()
+        if replace:
+            self.replace_edit.setFocus()
+        else:
+            self.find_edit.setFocus()
+            self.find_edit.selectAll()
+
+    def close_bar(self) -> None:
+        """Nasconde la barra e toglie l'evidenziazione dei risultati."""
+        self.hide()
+        self.editor.setExtraSelections([])
+        self.closed.emit()
+
+    # -- ricerca -------------------------------------------------------------- #
+    def _regex(self) -> QRegularExpression | None:
+        pattern = self.find_edit.text()
+        if not pattern:
+            self._last_error = ""
+            return None
+        if self.opt_word.isChecked():
+            pattern = rf"(?<!\w)(?:{pattern})(?!\w)"
+        rx = QRegularExpression(pattern)
+        if not self.opt_case.isChecked():
+            rx.setPatternOptions(
+                QRegularExpression.PatternOption.CaseInsensitiveOption
+            )
+        if not rx.isValid():
+            error = f"Espressione non valida: {rx.errorString()}"
+            if error != self._last_error:  # evita spam a ogni tasto
+                self._last_error = error
+                self.notice.emit(error)
+            return None
+        self._last_error = ""
+        return rx
+
+    def _compute_matches(self) -> list[tuple[int, int]]:
+        rx = self._regex()
+        if rx is None:
+            return []
+        matches: list[tuple[int, int]] = []
+        it = rx.globalMatch(self.editor.toPlainText())
+        while it.hasNext():
+            m = it.next()
+            start, end = m.capturedStart(), m.capturedEnd()
+            if end > start:  # i match a lunghezza 0 non sono navigabili
+                matches.append((start, end))
+        return matches
+
+    def refresh(self) -> None:
+        """Ricalcola i risultati e ridisegna l'evidenziazione."""
+        if not self.isVisible():
+            return
+        self._matches = self._compute_matches()
+        self._update_count()
+        self._repaint()
+
+    def _current_index(self) -> int:
+        """Indice del risultato corrente (= selezione uguale a un match)."""
+        cursor = self.editor.textCursor()
+        if not cursor.hasSelection():
+            return -1
+        start, end = cursor.selectionStart(), cursor.selectionEnd()
+        for i, (m_start, m_end) in enumerate(self._matches):
+            if m_start == start and m_end == end:
+                return i
+        return -1
+
+    def _repaint(self) -> None:
+        """Evidenzia i risultati (il corrente resta la selezione dell'editor)."""
+        if not self.isVisible():
+            return
+        current = self._current_index()
+        selections: list[QTextEdit.ExtraSelection] = []
+        for i, (start, end) in enumerate(self._matches):
+            if i == current:
+                continue  # disegnato dalla selezione reale (colore CURRENT)
+            sel = QTextEdit.ExtraSelection()
+            fmt = QTextCharFormat()
+            fmt.setBackground(QBrush(QColor(MATCH_COLOR)))
+            sel.format = fmt
+            cursor = QTextCursor(self.editor.document())
+            cursor.setPosition(start)
+            cursor.setPosition(end, QTextCursor.MoveMode.KeepAnchor)
+            sel.cursor = cursor
+            selections.append(sel)
+        self.editor.setExtraSelections(selections)
+
+    def _update_count(self) -> None:
+        if not self.find_edit.text():
+            self.lbl_count.setText("")
+            return
+        index = self._current_index()
+        self.lbl_count.setText(
+            f"{index + 1 if index >= 0 else 0}/{len(self._matches)}"
+        )
+
+    def find_next(self, backwards: bool = False) -> bool:
+        """Seleziona il risultato successivo (o precedente), con avvolgimento."""
+        if not self._matches:
+            self.notice.emit(
+                "Nessun risultato" if self.find_edit.text()
+                else "Inserisci il testo da cercare"
+            )
+            return False
+
+        cursor = self.editor.textCursor()
+        index = None
+        if backwards:
+            anchor = (
+                cursor.selectionStart() if cursor.hasSelection()
+                else cursor.position()
+            )
+            for i in range(len(self._matches) - 1, -1, -1):
+                if self._matches[i][1] <= anchor:
+                    index = i
+                    break
+            if index is None:
+                index = len(self._matches) - 1
+                self.notice.emit("Ricerca avvolta: tornata alla fine")
+        else:
+            anchor = (
+                cursor.selectionEnd() if cursor.hasSelection()
+                else cursor.position()
+            )
+            for i, (start, _end) in enumerate(self._matches):
+                if start >= anchor:
+                    index = i
+                    break
+            if index is None:
+                index = 0
+                self.notice.emit("Ricerca avvolta: tornata all'inizio")
+
+        start, end = self._matches[index]
+        found = QTextCursor(self.editor.document())
+        found.setPosition(start)
+        found.setPosition(end, QTextCursor.MoveMode.KeepAnchor)
+        self.editor.setTextCursor(found)
+        self.editor.centerCursor()
+        self._update_count()
+        return True
+
+    # -- sostituzione --------------------------------------------------------- #
+    def replace_current(self) -> None:
+        """Sostituisce il risultato corrente (selezionato) e va al successivo."""
+        if self._current_index() < 0:
+            # Nessun risultato selezionato: prima lo si seleziona.
+            self.find_next()
+            return
+        start, end = self._matches[self._current_index()]
+        cursor = QTextCursor(self.editor.document())
+        cursor.setPosition(start)
+        cursor.setPosition(end, QTextCursor.MoveMode.KeepAnchor)
+        cursor.insertText(self.replace_edit.text())
+        self.refresh()  # le posizioni cambiano con la sostituzione
+        self.find_next()
+
+    def replace_all(self) -> int:
+        """Sostituisce tutti i risultati in un unico passo di annullamento."""
+        if not self._matches:
+            self.notice.emit("Nessun risultato da sostituire")
+            return 0
+        matches = list(self._matches)
+        replacement = self.replace_edit.text()
+        cursor = QTextCursor(self.editor.document())
+        cursor.beginEditBlock()
+        for start, end in reversed(matches):  # dalla fine: posizioni stabili
+            cursor.setPosition(start)
+            cursor.setPosition(end, QTextCursor.MoveMode.KeepAnchor)
+            cursor.insertText(replacement)
+        cursor.endEditBlock()
+        self.refresh()
+        self._update_count()
+        self.notice.emit(f"Sostituiti {len(matches)} risultati")
+        return len(matches)
+
+
+# --------------------------------------------------------------------------- #
 #  Tab = un file Markdown aperto
 # --------------------------------------------------------------------------- #
 
@@ -610,13 +1297,15 @@ class MarkdownTab(QWidget):
 
     def __init__(
         self,
-        path: str,
+        path: str | None = None,
         dark: bool = False,
         prefs: ViewPrefs | None = None,
+        name: str | None = None,
         parent=None,
     ):
         super().__init__(parent)
-        self.path = os.path.abspath(path)
+        self.path = os.path.abspath(path) if path else None
+        self.name = name or "Senza titolo"
         self._dark = dark
         self._prefs = prefs if prefs is not None else ViewPrefs()
         self._loading = False
@@ -624,6 +1313,22 @@ class MarkdownTab(QWidget):
         # Sorgente
         self.editor = QPlainTextEdit()
         self.editor.setPlaceholderText("Sorgente Markdown…")
+        # Con uno stylesheet attivo il polish (es. all'ingresso in un tab)
+        # può azzerare il font dell'editor: il filtro lo riapplica.
+        self._src_font: QFont | None = None
+        self.editor.installEventFilter(self)
+
+        # Barra trova/sostituisci (stile Kate), sopra l'editor
+        self.find_bar = FindReplaceBar(self.editor)
+        self.find_bar.closed.connect(self.hide_find)
+        self.find_bar.notice.connect(self.notice.emit)
+
+        self.editor_host = QWidget()
+        host_lay = QVBoxLayout(self.editor_host)
+        host_lay.setContentsMargins(0, 0, 0, 0)
+        host_lay.setSpacing(0)
+        host_lay.addWidget(self.find_bar)
+        host_lay.addWidget(self.editor)
 
         # Anteprima
         self.preview = PreviewWidget()
@@ -631,7 +1336,7 @@ class MarkdownTab(QWidget):
         # Vista split
         self.splitter = QSplitter(Qt.Orientation.Horizontal)
         self.splitter.setChildrenCollapsible(False)
-        self.splitter.addWidget(self.editor)
+        self.splitter.addWidget(self.editor_host)
         self.splitter.addWidget(self.preview)
         self.splitter.setSizes([500, 500])
 
@@ -657,10 +1362,28 @@ class MarkdownTab(QWidget):
         self.set_prefs(self._prefs)   # font, colori, sintassi, riquadri
         self.load()
         self.render()
-        if os.path.isfile(self.path):
+        if self.path and os.path.isfile(self.path):
             self.watcher.addPath(self.path)
 
+    def eventFilter(self, obj, event) -> bool:
+        """Riapplica il font della sorgente se Qt lo azzera durante il polish."""
+        if (
+            obj is self.editor
+            and event.type() == QEvent.Type.FontChange
+            and self._src_font is not None
+            and self.editor.font() != self._src_font
+        ):
+            self.editor.setFont(self._src_font)
+        return super().eventFilter(obj, event)
+
     # -- stato -------------------------------------------------------------- #
+    @property
+    def display_name(self) -> str:
+        """Nome del file mostrato nelle tab e nel titolo."""
+        if self.path:
+            return os.path.basename(self.path)
+        return self.name
+
     def is_modified(self) -> bool:
         return self.editor.document().isModified()
 
@@ -672,6 +1395,8 @@ class MarkdownTab(QWidget):
     # -- I/O ---------------------------------------------------------------- #
     def load(self) -> None:
         """Legge il file da disco e lo carica nell'editor."""
+        if self.path is None:
+            return  # file nuovo: l'editor resta com'è (vuo o testo iniziale)
         try:
             with open(self.path, "r", encoding="utf-8", errors="replace") as fh:
                 text = fh.read()
@@ -687,6 +1412,9 @@ class MarkdownTab(QWidget):
 
     def save(self) -> bool:
         """Salva l'editor su disco. Ritorna True in caso di successo."""
+        if self.path is None:
+            self.notice.emit("Il file non ha ancora un percorso")
+            return False
         try:
             # Sospende il watch durante la scrittura per evitare loop di refresh
             watching = self.path in self.watcher.files()
@@ -705,6 +1433,24 @@ class MarkdownTab(QWidget):
                 f"Impossibile salvare {self.path}:\n{exc}",
             )
             return False
+
+    def save_as(self, path: str) -> bool:
+        """Assegna un percorso al file (nuovo o "Salva con nome") e salva."""
+        path = os.path.abspath(path)
+        old = self.path
+        if old == path:
+            return self.save()
+        if old and old in self.watcher.files():
+            self.watcher.removePath(old)
+        self.path = path
+        if self.save():
+            if path not in self.watcher.files():
+                self.watcher.addPath(path)
+            return True
+        self.path = old  # ripristina il percorso precedente in caso di errore
+        if old and old not in self.watcher.files() and os.path.isfile(old):
+            self.watcher.addPath(old)
+        return False
 
     def reload_from_disk(self, confirm: bool = True) -> None:
         """Ricarica il file dal disco (chiede conferma se ci sono modifiche)."""
@@ -752,11 +1498,14 @@ class MarkdownTab(QWidget):
         self._render_timer.stop()
         html = build_html(
             self.editor.toPlainText(),
-            os.path.basename(self.path),
+            self.display_name,
             self._dark,
             self._prefs,
         )
-        base = QUrl.fromLocalFile(os.path.dirname(self.path) + os.sep)
+        if self.path:
+            base = QUrl.fromLocalFile(os.path.dirname(self.path) + os.sep)
+        else:
+            base = QUrl()
         self.preview.set_html(html, base)
 
     # -- temi / preferenze / layout ----------------------------------------- #
@@ -781,6 +1530,11 @@ class MarkdownTab(QWidget):
         else:
             base_bg, placeholder = "#ffffff", "#8b949e"
             highlight, theme_text = "#0969da", "#1f2328"
+        # Con la barra di ricerca aperta il risultato corrente è la selezione:
+        # deve usare il colore dedicato (e testo scuro per restare leggibile).
+        highlight_text = "#ffffff"
+        if self.find_bar.isVisible():
+            highlight, highlight_text = CURRENT_COLOR, "#000000"
         pal = self.editor.palette()
         pal.setColor(QPalette.ColorRole.Base, QColor(base_bg))
         pal.setColor(
@@ -788,7 +1542,7 @@ class MarkdownTab(QWidget):
         )
         pal.setColor(QPalette.ColorRole.PlaceholderText, QColor(placeholder))
         pal.setColor(QPalette.ColorRole.Highlight, QColor(highlight))
-        pal.setColor(QPalette.ColorRole.HighlightedText, QColor("#ffffff"))
+        pal.setColor(QPalette.ColorRole.HighlightedText, QColor(highlight_text))
         self.editor.setPalette(pal)
 
     def set_prefs(self, prefs: ViewPrefs) -> None:
@@ -799,6 +1553,7 @@ class MarkdownTab(QWidget):
         default = default_src_font()
         font = QFont(prefs.src_family or default.family())
         font.setPixelSize(max(6, int(prefs.src_size or font_px(default))))
+        self._src_font = font
         self.editor.setFont(font)
 
         # Colore del testo e colorazione della sintassi
@@ -815,7 +1570,7 @@ class MarkdownTab(QWidget):
 
     def set_panes(self, show_source: bool, show_preview: bool) -> None:
         """Mostra/nasconde i due riquadri in modo indipendente."""
-        self.editor.setVisible(show_source)
+        self.editor_host.setVisible(show_source)
         self.preview.setVisible(show_preview)
         if show_source and show_preview:
             self.splitter.setSizes([500, 500])
@@ -823,6 +1578,87 @@ class MarkdownTab(QWidget):
             self.splitter.setSizes([1, 0])
         else:
             self.splitter.setSizes([0, 1])
+
+    # -- trova/sostituisci --------------------------------------------------- #
+    def show_find(self, replace: bool = False) -> None:
+        """Apre la barra di ricerca (con la sostituzione se richiesta)."""
+        cursor = self.editor.textCursor()
+        initial = ""
+        if cursor.hasSelection():
+            initial = cursor.selectedText()
+        self.find_bar.show_bar(replace=replace, initial=initial)
+        self._update_editor_palette()  # colore del risultato corrente
+
+    def hide_find(self) -> None:
+        """Chiude la barra di ricerca e ripristina i colori dell'editor."""
+        if not self.find_bar.isVisible():
+            return
+        self.find_bar.close_bar()
+        self._update_editor_palette()
+        self.editor.setFocus()
+
+    def toggle_find(self) -> None:
+        if self.find_bar.isVisible():
+            self.hide_find()
+        else:
+            self.show_find()
+
+    # -- riformattazione tabelle --------------------------------------------- #
+    def reformat_table(self) -> None:
+        """Riformatta la tabella sotto il cursore/allineando le colonne."""
+        lines = self.editor.toPlainText().split("\n")
+        doc = self.editor.document()
+        cursor = self.editor.textCursor()
+
+        first_blk = doc.findBlock(cursor.selectionStart()).blockNumber()
+        last_blk = doc.findBlock(cursor.selectionEnd()).blockNumber()
+        # Una selezione che finisce a inizio riga non include quella riga.
+        if (
+            last_blk > first_blk
+            and doc.findBlock(cursor.selectionEnd()).position()
+            == cursor.selectionEnd()
+        ):
+            last_blk -= 1
+
+        first, last, error = find_table_block(lines, first_blk, last_blk)
+        if error:
+            self.notice.emit(error)
+            return
+
+        block = lines[first : last + 1]
+        new_block, error = format_table(block, self._prefs.table_max_width)
+        if error:
+            self.notice.emit(error)
+            return
+        if new_block == block:
+            self.notice.emit("La tabella è già allineata")
+            return
+
+        # Sostituisce il blocco in un unico passo di annullamento.
+        first_block = doc.findBlockByNumber(first)
+        last_block = doc.findBlockByNumber(last)
+        edit = QTextCursor(first_block)
+        edit.setPosition(
+            last_block.position() + last_block.length() - 1,
+            QTextCursor.MoveMode.KeepAnchor,
+        )
+        edit.beginEditBlock()
+        edit.insertText("\n".join(new_block))
+        edit.endEditBlock()
+
+        # Seleziona la tabella appena formattata.
+        new_last = doc.findBlockByNumber(first + len(new_block) - 1)
+        selection = QTextCursor(doc)
+        selection.setPosition(first_block.position())
+        selection.setPosition(
+            new_last.position() + new_last.length() - 1,
+            QTextCursor.MoveMode.KeepAnchor,
+        )
+        self.editor.setTextCursor(selection)
+        self.notice.emit(
+            f"Tabella formattata ({len(new_block)} righe, "
+            f"max {self._prefs.table_max_width} caratteri)"
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -870,6 +1706,7 @@ QLabel#emptyLabel { color: #8b949e; font-size: 15px; }
 FILE_FILTER = (
     "File Markdown (*.md *.markdown *.mkd *.mdown *.txt);;Tutti i file (*)"
 )
+MAX_RECENT_FILES = 10  # voci del menu "Apri recenti"
 
 
 def system_dark() -> bool:
@@ -978,6 +1815,23 @@ class SettingsDialog(QDialog):
         prev_lay.setColumnStretch(1, 1)
         root.addWidget(prev_box)
 
+        # --- Modifica e tabelle --------------------------------------------- #
+        edit_box = QGroupBox("Modifica e tabelle")
+        edit_lay = QGridLayout(edit_box)
+
+        self.table_max_width = QSpinBox()
+        self.table_max_width.setRange(40, 400)
+        self.table_max_width.setSuffix(" caratteri")
+        self.table_max_width.setValue(prefs.table_max_width)
+        self.table_max_width.setToolTip(
+            "Durante la riformattazione ASCII delle tabelle, le righe più "
+            "lunghe della larghezza massima restano inalterate"
+        )
+        edit_lay.addWidget(QLabel("Larghezza massima riga tabella:"), 0, 0)
+        edit_lay.addWidget(self.table_max_width, 0, 1)
+        edit_lay.setColumnStretch(1, 1)
+        root.addWidget(edit_box)
+
         note = QLabel(
             "Il colore personalizzato vale per il testo: link e codice "
             "mantengono il loro colore. Le modifiche si applicano subito e "
@@ -1052,6 +1906,7 @@ class SettingsDialog(QDialog):
         self.prev_color_check.setChecked(False)
         self.prev_color = QColor(self._def_color)
         self._swatch(self.prev_color_btn, self.prev_color)
+        self.table_max_width.setValue(DEFAULT_TABLE_MAX_WIDTH)
 
     # -- raccolta dei valori ------------------------------------------------- #
     def _collect(self) -> ViewPrefs:
@@ -1070,6 +1925,7 @@ class SettingsDialog(QDialog):
             prev_family=prev_family,
             prev_size=int(self.prev_size.value()),
             prev_color=self.prev_color.name() if self.prev_color_check.isChecked() else "",
+            table_max_width=int(self.table_max_width.value()),
         )
 
     def accept(self) -> None:  # noqa: N802 (API Qt)
@@ -1115,21 +1971,40 @@ class MainWindow(QMainWindow):
         self._apply_theme()
         self._update_state()
 
+        # Il contenuto degli appunti cambia anche fuori dall'applicazione
+        QApplication.clipboard().dataChanged.connect(self._sync_edit_actions)
+
     # -- menu e azioni ------------------------------------------------------ #
     def _build_menus(self) -> None:
         menubar = self.menuBar()
 
+        # -- File ---------------------------------------------------------- #
         file_menu = menubar.addMenu("&File")
+
+        self.act_new = QAction("&Nuovo", self)
+        self.act_new.setShortcut(QKeySequence.StandardKey.New)
+        self.act_new.triggered.connect(self.new_file)
+        file_menu.addAction(self.act_new)
 
         self.act_open = QAction("&Apri…", self)
         self.act_open.setShortcut(QKeySequence.StandardKey.Open)
         self.act_open.triggered.connect(self.open_dialog)
         file_menu.addAction(self.act_open)
 
+        self.act_recent = file_menu.addMenu("Apri &recenti")
+        self.act_recent.aboutToShow.connect(self._populate_recent)
+
+        file_menu.addSeparator()
+
         self.act_save = QAction("&Salva", self)
         self.act_save.setShortcut(QKeySequence.StandardKey.Save)
         self.act_save.triggered.connect(self.save_current)
         file_menu.addAction(self.act_save)
+
+        self.act_save_as = QAction("Salva &con nome…", self)
+        self.act_save_as.setShortcut(QKeySequence("Ctrl+Shift+S"))
+        self.act_save_as.triggered.connect(self.save_as_dialog)
+        file_menu.addAction(self.act_save_as)
 
         self.act_reload = QAction("&Ricarica dal disco", self)
         self.act_reload.setShortcuts([QKeySequence("F5"), QKeySequence("Ctrl+R")])
@@ -1150,6 +2025,61 @@ class MainWindow(QMainWindow):
         self.act_quit.triggered.connect(self.close)
         file_menu.addAction(self.act_quit)
 
+        # -- Modifica -------------------------------------------------------- #
+        edit_menu = menubar.addMenu("&Modifica")
+
+        self.act_undo = QAction("&Annulla", self)
+        self.act_undo.setShortcut(QKeySequence.StandardKey.Undo)
+        self.act_undo.triggered.connect(lambda: self._edit_call("undo"))
+        edit_menu.addAction(self.act_undo)
+
+        self.act_redo = QAction("&Ripeti", self)
+        self.act_redo.setShortcuts(
+            [QKeySequence("Ctrl+Shift+Z"), QKeySequence("Ctrl+Y")]
+        )
+        self.act_redo.triggered.connect(lambda: self._edit_call("redo"))
+        edit_menu.addAction(self.act_redo)
+
+        edit_menu.addSeparator()
+
+        self.act_cut = QAction("Ta&glia", self)
+        self.act_cut.setShortcut(QKeySequence.StandardKey.Cut)
+        self.act_cut.triggered.connect(lambda: self._edit_call("cut"))
+        edit_menu.addAction(self.act_cut)
+
+        self.act_copy = QAction("&Copia", self)
+        self.act_copy.setShortcut(QKeySequence.StandardKey.Copy)
+        self.act_copy.triggered.connect(lambda: self._edit_call("copy"))
+        edit_menu.addAction(self.act_copy)
+
+        self.act_paste = QAction("In&colla", self)
+        self.act_paste.setShortcut(QKeySequence.StandardKey.Paste)
+        self.act_paste.triggered.connect(lambda: self._edit_call("paste"))
+        edit_menu.addAction(self.act_paste)
+
+        edit_menu.addSeparator()
+
+        self.act_find = QAction("&Cerca…", self)
+        self.act_find.setShortcut(QKeySequence("Ctrl+F"))
+        self.act_find.triggered.connect(lambda: self._show_find(False))
+        edit_menu.addAction(self.act_find)
+
+        self.act_replace = QAction("&Sostituisci…", self)
+        self.act_replace.setShortcut(QKeySequence("Ctrl+H"))  # Ctrl+R = Ricarica
+        self.act_replace.triggered.connect(lambda: self._show_find(True))
+        edit_menu.addAction(self.act_replace)
+
+        self.act_find_next = QAction("Risultato &successivo", self)
+        self.act_find_next.setShortcut(QKeySequence("F3"))
+        self.act_find_next.triggered.connect(lambda: self._find_next(False))
+        edit_menu.addAction(self.act_find_next)
+
+        self.act_find_prev = QAction("Risultato &precedente", self)
+        self.act_find_prev.setShortcut(QKeySequence("Shift+F3"))
+        self.act_find_prev.triggered.connect(lambda: self._find_next(True))
+        edit_menu.addAction(self.act_find_prev)
+
+        # -- Visualizza ------------------------------------------------------- #
         view_menu = menubar.addMenu("&Visualizza")
 
         self.act_show_source = QAction("Mostra &sorgente", self)
@@ -1195,6 +2125,18 @@ class MainWindow(QMainWindow):
         )
         view_menu.addAction(self.act_prev)
 
+        # -- Selezione -------------------------------------------------------- #
+        selection_menu = menubar.addMenu("&Selezione")
+
+        self.act_reformat_table = QAction("Ri&formatta tabella ASCII", self)
+        self.act_reformat_table.setShortcut(QKeySequence("Ctrl+Alt+T"))
+        self.act_reformat_table.setToolTip(
+            "Allinea le colonne della tabella sotto il cursore "
+            "(righe più lunghe della larghezza massima restano inalterate)"
+        )
+        self.act_reformat_table.triggered.connect(self.reformat_current_table)
+        selection_menu.addAction(self.act_reformat_table)
+
         settings_menu = menubar.addMenu("&Impostazioni")
         self.act_settings = QAction("&Preferenze…", self)
         self.act_settings.setShortcut(QKeySequence("Ctrl+,"))
@@ -1228,28 +2170,132 @@ class MainWindow(QMainWindow):
                 return tab
 
         tab = MarkdownTab(path, dark=self._dark, prefs=self.prefs)
-        tab.notice.connect(lambda msg: self.statusBar().showMessage(msg, 6000))
-        tab.modified_changed.connect(
-            lambda _mod, t=tab: self._on_modified(t)
-        )
-
-        idx = self._tabs.addTab(tab, self._tab_label(tab))
-        self._tabs.setTabToolTip(idx, path)
-        self._tabs.setCurrentIndex(idx)
-        self._stack.setCurrentWidget(self._tabs)
-        self._update_state()
+        self._adopt_tab(tab)
+        self._add_recent(path)
         self.statusBar().showMessage(f"Aperto {path}", 4000)
         return tab
 
+    def new_file(self) -> MarkdownTab | None:
+        """Crea un file nuovo: chiede il percorso solo al primo salvataggio."""
+        tab = MarkdownTab(
+            path=None,
+            dark=self._dark,
+            prefs=self.prefs,
+            name=self._untitled_name(),
+        )
+        self._adopt_tab(tab)
+        self.statusBar().showMessage(f"Nuovo file: {tab.name}", 4000)
+        return tab
+
+    def _untitled_name(self) -> str:
+        """Nome unico per un file nuovo ("Senza titolo", "Senza titolo 2",…)."""
+        existing = set()
+        for i in range(self._tabs.count()):
+            t = self._tabs.widget(i)
+            if isinstance(t, MarkdownTab):
+                existing.add(t.display_name)
+        base = "Senza titolo"
+        if base not in existing:
+            return base
+        n = 2
+        while f"{base} {n}" in existing:
+            n += 1
+        return f"{base} {n}"
+
+    def _adopt_tab(self, tab: MarkdownTab) -> MarkdownTab:
+        """Collega i segnali di un tab e lo aggiunge alla finestra."""
+        tab.notice.connect(lambda msg: self.statusBar().showMessage(msg, 6000))
+        tab.modified_changed.connect(lambda _mod, t=tab: self._on_modified(t))
+        # Stato delle azioni del menu Modifica
+        tab.editor.cursorPositionChanged.connect(self._sync_edit_actions)
+        document = tab.editor.document()
+        document.undoAvailable.connect(
+            lambda _b: self._sync_edit_actions()
+        )
+        document.redoAvailable.connect(
+            lambda _b: self._sync_edit_actions()
+        )
+
+        idx = self._tabs.addTab(tab, self._tab_label(tab))
+        self._tabs.setTabToolTip(idx, tab.path or tab.name)
+        self._tabs.setCurrentIndex(idx)
+        self._stack.setCurrentWidget(self._tabs)
+        self._update_state()
+        return tab
+
+    # -- file recenti -------------------------------------------------------- #
+    def _recent_files(self) -> list[str]:
+        raw = QSettings("mdv", "mdv").value("file/recent", [])
+        if raw is None:
+            return []
+        if isinstance(raw, str):  # con una sola voce QSettings restituisce str
+            raw = [raw] if raw else []
+        return [p for p in raw if isinstance(p, str) and p]
+
+    def _add_recent(self, path: str) -> None:
+        path = os.path.abspath(path)
+        recent = [p for p in self._recent_files() if p != path]
+        recent.insert(0, path)
+        settings = QSettings("mdv", "mdv")
+        settings.setValue("file/recent", recent[:MAX_RECENT_FILES])
+        settings.sync()
+
+    def _populate_recent(self) -> None:
+        """Ricostruisce il sottomenu "Apri recenti" all'apertura."""
+        self.act_recent.clear()
+        recent = self._recent_files()[:MAX_RECENT_FILES]
+        if not recent:
+            empty = self.act_recent.addAction("Nessun file recente")
+            empty.setEnabled(False)
+            return
+        for path in recent:
+            action = self.act_recent.addAction(os.path.basename(path))
+            action.setStatusTip(path)
+            action.setToolTip(path)
+            action.triggered.connect(
+                lambda _checked=False, p=path: self.open_file(p)
+            )
+
+    # -- salvataggio ---------------------------------------------------------- #
     def current_tab(self) -> MarkdownTab | None:
         w = self._tabs.currentWidget()
         return w if isinstance(w, MarkdownTab) else None
 
-    # -- operazioni sulla tab corrente -------------------------------------- #
     def save_current(self) -> None:
         tab = self.current_tab()
-        if tab:
+        if tab is None:
+            return
+        if tab.path is None:
+            self._save_as(tab, None)
+        else:
             tab.save()
+
+    def save_as_dialog(self) -> None:
+        tab = self.current_tab()
+        if tab:
+            self._save_as(tab, None)
+
+    def _save_as(self, tab: MarkdownTab, path: str | None) -> bool:
+        """Salva con nome; `path` consente di testare il flusso senza dialogo."""
+        if path is None:
+            initial = tab.path or os.path.join(os.getcwd(), tab.name)
+            path, _ = QFileDialog.getSaveFileName(
+                self, "Salva con nome", initial, FILE_FILTER
+            )
+            if not path:
+                return False  # annullato dall'utente
+        if not os.path.splitext(path)[1]:
+            path += ".md"  # estensione di comodità
+        if not tab.save_as(path):
+            return False
+        idx = self._tabs.indexOf(tab)
+        if idx >= 0:
+            self._tabs.setTabText(idx, self._tab_label(tab))
+            self._tabs.setTabToolTip(idx, tab.path or tab.name)
+        self._update_window_title()
+        self._add_recent(tab.path)
+        self._sync_edit_actions()
+        return True
 
     def reload_current(self) -> None:
         tab = self.current_tab()
@@ -1264,7 +2310,7 @@ class MainWindow(QMainWindow):
             return
 
         if tab.is_modified():
-            name = os.path.basename(tab.path)
+            name = tab.display_name
             ret = QMessageBox.question(
                 self, "Modifiche non salvate",
                 f"Vuoi salvare le modifiche di {name} prima di chiudere?",
@@ -1275,8 +2321,12 @@ class MainWindow(QMainWindow):
             )
             if ret == QMessageBox.StandardButton.Cancel:
                 return
-            if ret == QMessageBox.StandardButton.Save and not tab.save():
-                return
+            if ret == QMessageBox.StandardButton.Save:
+                if tab.path is None:
+                    if not self._save_as(tab, None):
+                        return  # salvataggio annullato o fallito
+                elif not tab.save():
+                    return
 
         self._tabs.removeTab(index)
         tab.deleteLater()
@@ -1291,7 +2341,7 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _tab_label(tab: MarkdownTab) -> str:
-        label = os.path.basename(tab.path)
+        label = tab.display_name
         return f"{label} *" if tab.is_modified() else label
 
     def _on_tab_changed(self, _index: int) -> None:
@@ -1308,11 +2358,13 @@ class MainWindow(QMainWindow):
         has_tabs = self._tabs.count() > 0
         self._stack.setCurrentWidget(self._tabs if has_tabs else self._empty)
         self.act_save.setEnabled(has_tabs)
+        self.act_save_as.setEnabled(has_tabs)
         self.act_reload.setEnabled(has_tabs)
         self.act_close.setEnabled(has_tabs)
         self.act_next.setEnabled(has_tabs)
         self.act_prev.setEnabled(has_tabs)
         self._update_window_title()
+        self._sync_edit_actions()
 
     # -- temi / layout ------------------------------------------------------ #
     def _apply_theme(self) -> None:
@@ -1382,16 +2434,73 @@ class MainWindow(QMainWindow):
             if isinstance(tab, MarkdownTab):
                 tab.set_panes(self._show_source, self._show_preview)
 
+    # -- menu Modifica / Selezione -------------------------------------------- #
+    def _edit_call(self, name: str) -> None:
+        """Inoltra un comando di modifica (undo/redo/cut/copy/paste) all'editor."""
+        tab = self.current_tab()
+        if tab is not None:
+            getattr(tab.editor, name)()
+
+    def _sync_edit_actions(self) -> None:
+        """Allinea le azioni del menu Modifica allo stato dell'editor corrente."""
+        tab = self.current_tab()
+        has = tab is not None
+        document = tab.editor.document() if has else None
+        cursor = tab.editor.textCursor() if has else None
+
+        self.act_undo.setEnabled(has and document.isUndoAvailable())
+        self.act_redo.setEnabled(has and document.isRedoAvailable())
+        selected = bool(cursor is not None and cursor.hasSelection())
+        self.act_cut.setEnabled(selected)
+        self.act_copy.setEnabled(selected)
+        self.act_paste.setEnabled(
+            has and bool(QApplication.clipboard().text())
+        )
+        for action in (
+            self.act_find,
+            self.act_replace,
+            self.act_find_next,
+            self.act_find_prev,
+            self.act_reformat_table,
+        ):
+            action.setEnabled(has)
+
+    def _show_find(self, replace: bool) -> None:
+        tab = self.current_tab()
+        if tab is None:
+            return
+        if not self._show_source:  # la ricerca vive nel riquadro sorgente
+            self.act_show_source.setChecked(True)
+        tab.show_find(replace)
+
+    def _find_next(self, backwards: bool) -> None:
+        tab = self.current_tab()
+        if tab is None:
+            return
+        if not self._show_source:
+            self.act_show_source.setChecked(True)
+        if not tab.find_bar.isVisible():
+            tab.show_find()  # F3 anche con la barra chiusa
+        tab.find_bar.find_next(backwards)
+
+    def reformat_current_table(self) -> None:
+        tab = self.current_tab()
+        if tab is not None:
+            tab.reformat_table()
+
     def _about(self) -> None:
         engine = "QWebEngineView" if HAVE_WEBENGINE else "QTextBrowser (fallback)"
         QMessageBox.information(
             self, "Informazioni su mdv",
             "<b>mdv</b> — reader GUI per file Markdown<br><br>"
-            "• più file in tab dedicate<br>"
+            "• più file in tab dedicate, file nuovi e recenti<br>"
+            "• menu Modifica: annulla/riprendi, taglia/copia/incolla,<br>"
+            "&nbsp;&nbsp;cerca e sostituisci con barra stile Kate (Ctrl+F / Ctrl+H)<br>"
             "• riquadri sorgente/anteprima indipendenti "
             "(Ctrl+Shift+E / Ctrl+Shift+P)<br>"
-            "• Impostazioni: vista all'apertura, font, colori, sintassi "
-            "(Ctrl+,)<br>"
+            "• menu Selezione: riformattazione ASCII delle tabelle (Ctrl+Alt+T)<br>"
+            "• Impostazioni: vista all'apertura, font, colori, sintassi, "
+            "larghezza tabelle (Ctrl+,)<br>"
             "• dark mode (Ctrl+Shift+D)<br>"
             "• auto-refresh al cambio su disco (F5 per ricaricare)<br>"
             "• salvataggio con Ctrl+S, apertura con Ctrl+O<br><br>"
