@@ -14,14 +14,17 @@ Reader GUI per file Markdown con visualizzazione a **tab**, scritto in Python co
   - **Apri recenti**: ultimi 10 file aperti, in ordine di utilizzo;
   - **Salva con nome…** (`Ctrl+Shift+S`), con estensione `.md` aggiunta se mancante.
 - **Menu *Modifica***: annulla/riprendi, taglia/copia/incolla e **cerca/sostituisci**
-  con barra stile Kate/KWrite: campo *Trova*, opzioni (maiuscole/minuscole,
-  parola intera, regex), frecce, contatore e campo *Sostituisci*;
-  evidenziazione live dei risultati, `Enter`/`Shift+Enter` per scorrere,
-  `Esc` per chiudere.
+  con barra stile Kate/KWrite **in fondo alla finestra**: campo *Trova*, opzioni
+  (maiuscole/minuscole, parola intera, regex), frecce, contatore e campo
+  *Sostituisci*; evidenziazione live dei risultati, `Enter`/`Shift+Enter` per
+  scorrere, `Esc` per chiudere.
 - **Menu *Selezione***: **riformattazione ASCII delle tabelle** (`Ctrl+Alt+T`):
   allinea le colonne della tabella sotto il cursore (o della selezione) secondo
   gli allineamenti dichiarati; le righe che superano la **larghezza massima**
   configurata restano inalterate, così come le righe che non ci starebbero mai.
+  Anche una **sostituzione dentro la tabella** che ne cambia la lunghezza
+  (cerca/sostituisci) riallinea automaticamente le colonne, nello stesso passo
+  di annullamento.
 - **Menu *Impostazioni*** (`Ctrl+,`), con valori predefiniti pari al comportamento
   attuale e persistiti su disco (`~/.config/mdv/mdv.conf`):
   - **vista all'apertura**: split view, solo anteprima formattata o solo sorgente;
@@ -109,7 +112,9 @@ Un unico file, `mdv.py`, organizzato in:
 - `format_table()` + `find_table_block()` — riformattazione ASCII delle tabelle
   (funzioni pure, testabili senza GUI);
 - `MarkdownHighlighter` — evidenziazione sintattica della sorgente (attivabile);
-- `FindReplaceBar` — barra trova/sostituisci con evidenziazione live;
+- `FindReplaceBar` — barra trova/sostituisci (in fondo alla finestra) con
+  evidenziazione live; dopo una sostituzione che ne cambia la larghezza chiede
+  al tab di riallineare la tabella interessata (callback `reformat_at`);
 - `PreviewWidget` — anteprima con `QWebEngineView` (fallback `QTextBrowser`);
 - `MarkdownTab` — un file aperto: editor + anteprima + `QFileSystemWatcher` per l'auto-refresh;
 - `MainWindow` — tab, menu (File/Modifica/Visualizza/Selezione/Impostazioni/Aiuto),

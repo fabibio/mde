@@ -27,6 +27,7 @@ import os
 import re
 import sys
 import unicodedata
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import markdown
@@ -998,14 +999,25 @@ class FindReplaceBar(QWidget):
     Layout stile Kate/KWrite: riga "Trova" con opzioni (maiuscole/minuscole,
     parola intera, regex), frecce per scorrere, contatore e chiusura; riga
     "Sostituisci" con i pulsanti di sostituzione.
+
+    `reformat_at` è il callback invocato (con i numeri di riga, 0-based) quando
+    una sostituzione ne cambia la larghezza dentro una tabella: chi lo fornisce
+    riallinea le colonne della tabella interessata.
     """
 
     notice = Signal(str)  # messaggi per la barra di stato
     closed = Signal()     # l'utente ha chiuso la barra (Esc o ✕)
 
-    def __init__(self, editor: QPlainTextEdit, parent=None):
+    def __init__(
+        self,
+        editor: QPlainTextEdit,
+        parent=None,
+        *,
+        reformat_at: Callable[[list[int]], None] | None = None,
+    ):
         super().__init__(parent)
         self.editor = editor
+        self._reformat_at = reformat_at
         self._matches: list[tuple[int, int]] = []
         self._last_error = ""
 
@@ -1251,6 +1263,35 @@ class FindReplaceBar(QWidget):
         return True
 
     # -- sostituzione --------------------------------------------------------- #
+    @staticmethod
+    def _changed_positions(
+        matches: list[tuple[int, int]], text: str, replacement: str
+    ) -> list[int]:
+        """Posizioni finali delle sostituzioni che ne cambiano la larghezza.
+
+        Le posizioni sono ricalcolate cumulando lo scarto di lunghezza delle
+        sostituzioni precedenti (l'ordine è quello del testo finale).
+        """
+        delta = 0
+        out: list[int] = []
+        for start, end in sorted(matches):
+            if display_width(text[start:end]) != display_width(replacement):
+                out.append(start + delta)
+            delta += len(replacement) - (end - start)
+        return out
+
+    def _reformat_at_positions(self, positions: list[int]) -> None:
+        """Chiede la riformattazione delle tabelle che contengono `positions`.
+
+        Da inviare entro lo stesso blocco di modifica della sostituzione, così
+        annullare riporta indietro sia il testo sia l'allineamento.
+        """
+        if not positions or self._reformat_at is None:
+            return
+        final_text = self.editor.toPlainText()
+        blocks = sorted({final_text.count("\n", 0, p) for p in positions})
+        self._reformat_at(blocks)
+
     def replace_current(self) -> None:
         """Sostituisce il risultato corrente (selezionato) e va al successivo."""
         if self._current_index() < 0:
@@ -1258,10 +1299,16 @@ class FindReplaceBar(QWidget):
             self.find_next()
             return
         start, end = self._matches[self._current_index()]
+        text = self.editor.toPlainText()
+        replacement = self.replace_edit.text()
+        positions = self._changed_positions([(start, end)], text, replacement)
         cursor = QTextCursor(self.editor.document())
+        cursor.beginEditBlock()  # sostituzione + eventuale riformattazione
         cursor.setPosition(start)
         cursor.setPosition(end, QTextCursor.MoveMode.KeepAnchor)
-        cursor.insertText(self.replace_edit.text())
+        cursor.insertText(replacement)
+        self._reformat_at_positions(positions)
+        cursor.endEditBlock()
         self.refresh()  # le posizioni cambiano con la sostituzione
         self.find_next()
 
@@ -1272,12 +1319,15 @@ class FindReplaceBar(QWidget):
             return 0
         matches = list(self._matches)
         replacement = self.replace_edit.text()
+        text = self.editor.toPlainText()
+        positions = self._changed_positions(matches, text, replacement)
         cursor = QTextCursor(self.editor.document())
         cursor.beginEditBlock()
         for start, end in reversed(matches):  # dalla fine: posizioni stabili
             cursor.setPosition(start)
             cursor.setPosition(end, QTextCursor.MoveMode.KeepAnchor)
             cursor.insertText(replacement)
+        self._reformat_at_positions(positions)
         cursor.endEditBlock()
         self.refresh()
         self._update_count()
@@ -1318,8 +1368,11 @@ class MarkdownTab(QWidget):
         self._src_font: QFont | None = None
         self.editor.installEventFilter(self)
 
-        # Barra trova/sostituisci (stile Kate), sopra l'editor
-        self.find_bar = FindReplaceBar(self.editor)
+        # Barra trova/sostituisci (stile Kate/KWrite): vive in fondo alla
+        # finestra, sotto i riquadri (vedi il layout qui sotto).
+        self.find_bar = FindReplaceBar(
+            self.editor, reformat_at=self._reformat_tables_at
+        )
         self.find_bar.closed.connect(self.hide_find)
         self.find_bar.notice.connect(self.notice.emit)
 
@@ -1327,7 +1380,6 @@ class MarkdownTab(QWidget):
         host_lay = QVBoxLayout(self.editor_host)
         host_lay.setContentsMargins(0, 0, 0, 0)
         host_lay.setSpacing(0)
-        host_lay.addWidget(self.find_bar)
         host_lay.addWidget(self.editor)
 
         # Anteprima
@@ -1343,7 +1395,13 @@ class MarkdownTab(QWidget):
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(0)
-        lay.addWidget(self.splitter)
+        # Stretch: il splitter prende tutto lo spazio in eccesso, la barra
+        # resta alla sua altezza naturale (è sempre visibile, non è più
+        # un figlio nascosto dell'host sorgente).
+        lay.addWidget(self.splitter, 1)
+        # In fondo, come in KWrite: la barra attraversa tutta la larghezza
+        # della finestra, sotto l'anteprima e la sorgente.
+        lay.addWidget(self.find_bar, 0)
 
         # Timer per il render "debounced" mentre si digita
         self._render_timer = QTimer(self)
@@ -1659,6 +1717,39 @@ class MarkdownTab(QWidget):
             f"Tabella formattata ({len(new_block)} righe, "
             f"max {self._prefs.table_max_width} caratteri)"
         )
+
+    def _reformat_tables_at(self, blocks: list[int]) -> None:
+        """Riallinea le tabelle che contengono le righe `blocks`.
+
+        Usato dalla barra trova/sostituisci dopo una sostituzione che ne
+        cambia la larghezza: le colonne vengono riallineate, le righe che
+        superano la larghezza massima restano inalterate (format_table).
+        Da chiamare dentro il blocco di modifica della sostituzione, così un
+        singolo annullamento riporta indietro testo e allineamento.
+        """
+        lines = self.editor.toPlainText().split("\n")
+        doc = self.editor.document()
+        done: set[tuple[int, int]] = set()
+        for blk in sorted(set(blocks)):
+            if not 0 <= blk < len(lines):
+                continue
+            first, last, error = find_table_block(lines, blk)
+            if error or (first, last) in done:
+                continue  # non è una tabella (o già riallineata)
+            done.add((first, last))
+            block = lines[first : last + 1]
+            new_block, error = format_table(block, self._prefs.table_max_width)
+            if error or new_block == block:
+                continue
+            first_block = doc.findBlockByNumber(first)
+            last_block = doc.findBlockByNumber(last)
+            edit = QTextCursor(first_block)
+            edit.setPosition(
+                last_block.position() + last_block.length() - 1,
+                QTextCursor.MoveMode.KeepAnchor,
+            )
+            edit.insertText("\n".join(new_block))
+            lines[first : last + 1] = new_block  # per le tabelle successive
 
 
 # --------------------------------------------------------------------------- #
