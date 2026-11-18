@@ -23,12 +23,14 @@ Uso:
 from __future__ import annotations
 
 import html as html_lib
+import json
 import os
 import re
 import sys
 import unicodedata
 from collections.abc import Callable
 from dataclasses import dataclass
+from html.parser import HTMLParser
 
 import markdown
 from PyQt6.QtCore import (
@@ -45,6 +47,7 @@ from PyQt6.QtGui import (
     QAction,
     QBrush,
     QColor,
+    QDesktopServices,
     QDragEnterEvent,
     QDropEvent,
     QFont,
@@ -92,9 +95,11 @@ from PyQt6.QtWidgets import (
 
 try:
     from PyQt6.QtWebEngineWidgets import QWebEngineView
+    from PyQt6.QtWebEngineCore import QWebEnginePage
     HAVE_WEBENGINE = True
 except Exception:  # pragma: no cover - QtWebEngine non disponibile
     QWebEngineView = None
+    QWebEnginePage = None
     HAVE_WEBENGINE = False
 
 # Fallback manuale (utile su sistemi senza OpenGL / ambienti headless)
@@ -574,6 +579,736 @@ def format_table(
     return out, None
 
 
+# --------------------------------------------------------------------------- #
+#  HTML -> Markdown (correzioni rapide in anteprima: doppio click su un blocco)
+# --------------------------------------------------------------------------- #
+
+_HEADING_TAGS = ("h1", "h2", "h3", "h4", "h5", "h6")
+_BLOCK_TAGS = set(_HEADING_TAGS) | {
+    "p", "ul", "ol", "dl", "blockquote", "pre", "table", "hr", "div",
+}
+
+_ATX_RE = re.compile(r" {0,3}#{1,6}(\s|$)")
+_FENCE_OPEN_RE = re.compile(r" {0,3}(`{3,}|~{3,})")
+_FENCE_CLOSE_RE = re.compile(r" {0,3}(`{3,}|~{3,})\s*$")
+_HR_RE = re.compile(r" {0,3}([-*_])( *\1){2,}\s*$")
+_SETEXT_RE = re.compile(r" {0,3}(=+|-{2,})\s*$")
+_LIST_RE = re.compile(r"( {0,3})([-*+]|\d{1,9}[.)])( +|$)")
+_QUOTE_RE = re.compile(r" {0,3}>")
+
+
+class _HtmlNode:
+    """Nodo dell'albero HTML (costruito con html.parser, solo stdlib)."""
+
+    __slots__ = ("tag", "attrs", "children")
+
+    def __init__(self, tag: str = "", attrs=None):
+        self.tag = tag
+        self.attrs = dict(attrs or ())
+        self.children: list = []
+
+    def get(self, name: str, default: str = "") -> str:
+        value = self.attrs.get(name)
+        return default if value is None else str(value)
+
+    @property
+    def classes(self) -> list[str]:
+        return self.get("class").split()
+
+
+class _HtmlTreeParser(HTMLParser):
+    """Converte un frammento HTML in un albero di _HtmlNode."""
+
+    VOID = {
+        "area", "base", "br", "col", "embed", "hr", "img", "input",
+        "link", "meta", "source", "track", "wbr",
+    }
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.root = _HtmlNode("#root")
+        self._stack = [self.root]
+
+    def handle_starttag(self, tag, attrs):
+        node = _HtmlNode(tag, attrs)
+        self._stack[-1].children.append(node)
+        if tag not in self.VOID:
+            self._stack.append(node)
+
+    def handle_startendtag(self, tag, attrs):
+        self._stack[-1].children.append(_HtmlNode(tag, attrs))
+
+    def handle_endtag(self, tag):
+        # HTML malformato: salva fino al tag corrispondente più esterno.
+        for i in range(len(self._stack) - 1, 0, -1):
+            if self._stack[i].tag == tag:
+                del self._stack[i:]
+                break
+
+    def handle_data(self, data):
+        if data:
+            self._stack[-1].children.append(data)
+
+
+def _parse_html(html: str) -> _HtmlNode:
+    parser = _HtmlTreeParser()
+    parser.feed(html)
+    parser.close()
+    return parser.root
+
+
+def _find_all(node, tag: str):
+    """Tutti i discendenti (e il nodo stesso) con il tag indicato."""
+    if isinstance(node, _HtmlNode):
+        if node.tag == tag:
+            yield node
+        for child in node.children:
+            yield from _find_all(child, tag)
+
+
+def _raw_text(node) -> str:
+    """Testo non escaped (per blocchi <pre> e <code>)."""
+    if isinstance(node, str):
+        return node
+    return "".join(_raw_text(child) for child in node.children)
+
+
+def _escape_md_text(text: str, in_table: bool = False) -> str:
+    """Escape del testo: la riconversione deve rendere il testo identico."""
+    if not text:
+        return ""
+    out = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    out = out.replace("\\", "\\\\")
+    for ch in ("*", "_", "`", "[", "]"):
+        out = out.replace(ch, "\\" + ch)
+    if in_table:
+        out = out.replace("|", "\\|")
+    # Inizi di riga che diventerebbero sintassi Markdown.
+    out = re.sub(r"(?m)^([ \t]*)(#{1,6})(?=\s)", r"\1\\\2", out)
+    out = re.sub(r"(?m)^([ \t]*)([+-])(?=\s)", r"\1\\\2", out)
+    out = re.sub(r"(?m)^([ \t]*)(\d{1,9})([.)])(?=\s)", r"\1\2\\\3", out)
+    out = re.sub(r"(?m)^([ \t]*)(=+|-{2,})[ \t]*$", r"\1\\\2", out)
+    return out
+
+
+def _md_code_span(text: str) -> str:
+    runs = re.findall(r"`+", text)
+    n_backticks = (max(len(r) for r in runs) + 1) if runs else 1
+    fence = "`" * n_backticks
+    if text.startswith("`") or text.endswith("`"):
+        return f"{fence} {text} {fence}"
+    return f"{fence}{text}{fence}"
+
+
+def _md_inline(nodes, in_table: bool = False) -> str:
+    parts: list[str] = []
+    for n in nodes:
+        if isinstance(n, str):
+            parts.append(_escape_md_text(n, in_table))
+            continue
+        tag = n.tag
+        if tag == "br":
+            parts.append(" " if in_table else "  \n")
+            continue
+        if tag == "img":
+            src = n.get("src")
+            alt = _md_inline(n.children, in_table)
+            title = n.get("title")
+            if src and title:
+                parts.append(f'![{alt}]({src} "{title}")')
+            elif src:
+                parts.append(f"![{alt}]({src})")
+            else:
+                parts.append(alt)
+            continue
+        if tag == "a":
+            href = n.get("href")
+            classes = n.classes
+            if "footnote-backref" in classes or href.startswith("#fnref"):
+                continue  # richiamo a piè di pagina
+            if "footnote-ref" in classes or href.startswith("#fn:"):
+                # Riferimento: #fn:1 (o #fn1) -> [^1]
+                label = href[4:] if href.startswith("#fn:") else href[3:]
+                parts.append(f"[^{label}]")
+                continue
+            inner = _md_inline(n.children, in_table)
+            if not inner:
+                continue
+            if not href or inner == href:
+                parts.append(inner)
+            else:
+                dest = f"<{href}>" if ("(" in href or " " in href) else href
+                title = n.get("title")
+                if title:
+                    parts.append(f'[{inner}]({dest} "{title}")')
+                else:
+                    parts.append(f"[{inner}]({dest})")
+            continue
+        if tag == "code":
+            parts.append(_md_code_span(_raw_text(n).replace("\n", " ")))
+            continue
+        inner = _md_inline(n.children, in_table)
+        if tag in ("strong", "b"):
+            parts.append(f"**{inner}**" if inner.strip() else inner)
+        elif tag in ("em", "i"):
+            parts.append(f"*{inner}*" if inner.strip() else inner)
+        elif tag in ("del", "s", "strike"):
+            parts.append(f"~~{inner}~~" if inner.strip() else inner)
+        else:
+            # Tag inline sconosciuto (sup, sub, span, abbr, …): HTML grezzo,
+            # python-markdown lo lascia passare invariato.
+            attrs = "".join(
+                f' {k}="{html_lib.escape(str(v), quote=True)}"'
+                if v is not None
+                else f" {k}"
+                for k, v in n.attrs.items()
+            )
+            parts.append(f"<{tag}{attrs}>{inner}</{tag}>")
+    return "".join(parts)
+
+
+def _md_list(node: _HtmlNode) -> str:
+    ordered = node.tag == "ol"
+    items = [
+        c for c in node.children
+        if isinstance(c, _HtmlNode) and c.tag == "li"
+    ]
+    if not items:
+        return ""
+    loose = any(
+        any(isinstance(c, _HtmlNode) and c.tag == "p" for c in li.children)
+        for li in items
+    )
+    rendered: list[str] = []
+    for index, li in enumerate(items):
+        marker = f"{index + 1}." if ordered else "-"
+        pad = " " * (len(marker) + 1)
+        nested = [
+            c for c in li.children
+            if isinstance(c, _HtmlNode) and c.tag in ("ul", "ol")
+        ]
+        rest = [c for c in li.children if c not in nested]
+        body = _md_blocks(rest)
+        body_lines = body.split("\n") if body.strip() else [""]
+        lines = [f"{marker} {body_lines[0]}".rstrip()]
+        lines += [(pad + line) if line else "" for line in body_lines[1:]]
+        for sub in nested:
+            sub_text = _md_list(sub)
+            if sub_text:
+                lines += [
+                    (pad + line) if line else "" for line in sub_text.split("\n")
+                ]
+        rendered.append("\n".join(lines))
+    return ("\n\n" if loose else "\n").join(rendered)
+
+
+def _md_deflist(node: _HtmlNode) -> str:
+    out: list[str] = []
+    for c in node.children:
+        if isinstance(c, str):
+            continue
+        if c.tag == "dt":
+            text = _md_inline(c.children).strip()
+            if text:
+                if out:
+                    out.append("")  # riga vuota fra due termini
+                out.append(text)
+        elif c.tag == "dd":
+            body = _md_blocks(c.children).strip()
+            if not body:
+                continue
+            lines = body.split("\n")
+            out.append(": " + lines[0])
+            out.extend("  " + line for line in lines[1:])
+    return "\n".join(out)
+
+
+def _md_blockquote(node: _HtmlNode) -> str:
+    inner = _md_blocks(node.children).strip("\n")
+    if not inner:
+        return ""
+    return "\n".join(
+        ("> " + line) if line.strip() else ">" for line in inner.split("\n")
+    )
+
+
+def _md_pre(node: _HtmlNode) -> str:
+    code = next(
+        (c for c in node.children if isinstance(c, _HtmlNode) and c.tag == "code"),
+        None,
+    )
+    text = _raw_text(code if code is not None else node)
+    if text.endswith("\n"):
+        text = text[:-1]
+    info = ""
+    if code is not None:
+        m = re.search(r"language-([\w+#.-]+)", code.get("class"))
+        if m:
+            info = m.group(1)
+    runs = re.findall(r"`+", text)
+    longest = max((len(r) for r in runs), default=0)
+    fence = "`" * max(3, longest + 1)
+    return f"{fence}{info}\n{text}\n{fence}"
+
+
+def _cell_align(cell: _HtmlNode) -> str | None:
+    m = re.search(r"text-align:\s*(\w+)", cell.get("style"))
+    value = (m.group(1) if m else cell.get("align")).lower()
+    return value if value in ("left", "right", "center") else None
+
+
+def _md_table(node: _HtmlNode) -> str:
+    rows: list[list[_HtmlNode]] = []
+    for tr in _find_all(node, "tr"):
+        cells = [
+            c for c in tr.children
+            if isinstance(c, _HtmlNode) and c.tag in ("th", "td")
+        ]
+        if cells:
+            rows.append(cells)
+    if not rows:
+        return ""
+    ncol = max(len(r) for r in rows)
+    aligns = [_cell_align(c) for c in rows[0]] + [None] * (ncol - len(rows[0]))
+
+    def fmt(cells) -> str:
+        vals = [
+            " ".join(_md_inline(c.children, in_table=True).split())
+            for c in cells
+        ]
+        vals += [""] * (ncol - len(vals))
+        return "| " + " | ".join(vals) + " |"
+
+    def delim(align) -> str:
+        if align == "left":
+            return ":--"
+        if align == "right":
+            return "--:"
+        if align == "center":
+            return ":--:"
+        return "---"
+
+    lines = [fmt(rows[0]), "| " + " | ".join(delim(a) for a in aligns) + " |"]
+    lines += [fmt(r) for r in rows[1:]]
+    return "\n".join(lines)
+
+
+def _md_footnotes(node: _HtmlNode) -> str:
+    out: list[str] = []
+    for li in _find_all(node, "li"):
+        fid = li.get("id")
+        if fid.startswith("fn:"):
+            label = fid[3:]
+        elif fid.startswith("fn"):
+            label = fid[2:]
+        else:
+            label = str(len(out) + 1)
+        body = " ".join(_md_blocks(li.children).split())
+        out.append(f"[^{label}]: {body}")
+    return "\n\n".join(out)
+
+
+def _md_blocks(nodes, in_table: bool = False) -> str:
+    """Converte nodi HTML di livello blocco in Markdown (separati da riga vuota)."""
+    out: list[str] = []
+    buf: list = []
+
+    def flush() -> None:
+        if buf:
+            text = _md_inline(buf, in_table).strip()
+            if text:
+                out.append(text)
+            buf.clear()
+
+    for n in nodes:
+        if isinstance(n, str):
+            buf.append(n)
+            continue
+        tag = n.tag
+        has_block_child = any(
+            isinstance(c, _HtmlNode) and c.tag in _BLOCK_TAGS for c in n.children
+        )
+        if tag in _HEADING_TAGS:
+            flush()
+            text = " ".join(_md_inline(n.children).split())
+            out.append((f"{'#' * int(tag[1])} {text}").rstrip())
+        elif tag == "p":
+            flush()
+            if has_block_child:
+                # <p> con blocchi dentro (Invio in contenteditable)
+                out.append(_md_blocks(n.children, in_table))
+            else:
+                text = _md_inline(n.children, in_table).strip()
+                if text:
+                    out.append(text)
+        elif tag == "hr":
+            flush()
+            out.append("---")
+        elif tag in ("ul", "ol"):
+            flush()
+            out.append(_md_list(n))
+        elif tag == "dl":
+            flush()
+            out.append(_md_deflist(n))
+        elif tag == "blockquote":
+            flush()
+            out.append(_md_blockquote(n))
+        elif tag == "pre":
+            flush()
+            out.append(_md_pre(n))
+        elif tag == "table":
+            flush()
+            out.append(_md_table(n))
+        elif tag in ("td", "th"):
+            flush()
+            out.append(_md_inline(n.children, in_table=True).strip())
+        elif tag == "dt":
+            flush()
+            out.append(_md_inline(n.children).strip())
+        elif tag == "dd":
+            flush()
+            out.append(_md_blocks(n.children, in_table).strip())
+        elif tag == "div" and any(
+            c == "footnote" or c.startswith("footnote") for c in n.classes
+        ):
+            flush()
+            out.append(_md_footnotes(n))
+        elif tag == "div" or has_block_child:
+            flush()
+            out.append(_md_blocks(n.children, in_table))
+        else:
+            buf.append(n)
+    flush()
+    return "\n\n".join(x for x in out if x and x.strip())
+
+
+def html_to_markdown(html: str) -> str:
+    """Converte un frammento HTML dell'anteprima in testo Markdown."""
+    root = _parse_html(html)
+    elements = [c for c in root.children if isinstance(c, _HtmlNode)]
+    if (
+        len(elements) == 1
+        and elements[0].tag == "div"
+        and "footnote" not in elements[0].classes
+    ):
+        # Blocco HTML grezzo nel sorgente (md_in_html): python-markdown lo
+        # lascia passare invariato, quindi lo riscriviamo com'era.
+        return html.strip()
+    return _md_blocks(root.children).strip("\n")
+
+
+def _inline_markdown(html: str) -> str:
+    """Forma inline di un blocco: serve quando lo span non copre la regione
+    intera (la sostituzione va inserita fra marker di riga già presenti)."""
+    root = _parse_html(html)
+    elems = [c for c in root.children if isinstance(c, _HtmlNode)]
+    if len(elems) == 1:
+        node = elems[0]
+        if node.tag in ("td", "th"):
+            return _md_inline(node.children, in_table=True).strip()
+        if node.tag == "dt":
+            return _md_inline(node.children).strip()
+        if node.tag == "dd":
+            return _md_blocks(node.children).strip("\n")
+        return _md_inline(node.children).strip()
+    return _md_blocks(root.children).strip("\n")
+
+
+# -- individuazione del blocco sorgente ------------------------------------- #
+
+def _render_md(md_text: str) -> str:
+    """Markdown -> HTML (stesse estensioni di build_html)."""
+    return markdown.markdown(
+        md_text, extensions=MD_EXTENSIONS, extension_configs=MD_EXTENSION_CONFIGS
+    )
+
+
+def _norm_with_map(text: str) -> tuple[str, list[int]]:
+    """Normalizza per il confronto (spazi compattati, '_' -> '*') tenendo
+    la mappa posizione normalizzata -> posizione originale."""
+    out: list[str] = []
+    idx: list[int] = []
+    prev_ws = False
+    for i, ch in enumerate(text):
+        if ch.isspace():
+            if prev_ws:
+                continue
+            out.append(" ")
+            idx.append(i)
+            prev_ws = True
+        else:
+            out.append("*" if ch == "_" else ch)
+            idx.append(i)
+            prev_ws = False
+    return "".join(out), idx
+
+
+def _norm(text: str) -> str:
+    return _norm_with_map(text)[0]
+
+
+def _find_span(text: str, start: int, end: int, needle: str) -> tuple[int, int] | None:
+    """Cerca `needle` (normalizzata) in text[start:end]: ritorna gli offset
+    assoluti del match, oppure None."""
+    key = _norm(needle)
+    if not key:
+        return None
+    hay, idx = _norm_with_map(text[start:end])
+    pos = hay.find(key)
+    if pos < 0:
+        return None
+    return start + idx[pos], start + idx[pos + len(key) - 1] + 1
+
+
+def _plain_text(html: str) -> str:
+    """Testo visibile di un frammento/HTML, normalizzato (per i confronti)."""
+    return " ".join(_raw_text(_parse_html(html)).split())
+
+
+def split_source_blocks(md_text: str) -> list[tuple[int, int]]:
+    """Suddivide il sorgente in blocchi coerenti con l'HTML prodotto.
+
+    Ogni blocco è un intervallo di offset (inizio, fine) dei caratteri del
+    sorgente: paragrafi, intestazioni (ATX e setext), liste (anche sciolte),
+    citazioni, tabelle, blocchi di codice fenced, orizzontali e def list.
+    """
+    lines = md_text.split("\n")
+    starts: list[int] = []
+    offset = 0
+    for line in lines:
+        starts.append(offset)
+        offset += len(line) + 1
+
+    def end_of(last: int) -> int:
+        """Offset di fine del blocco che finisce alla riga `last` (exclus)."""
+        if last >= len(lines):
+            return len(md_text)
+        return max(starts[last] - 1, starts[last - 1] if last else 0)
+
+    def table_start(j: int) -> bool:
+        return (
+            j + 1 < len(lines)
+            and "|" in lines[j]
+            and _is_delim_line(lines[j + 1])
+        )
+
+    def block_start(j: int) -> bool:
+        line = lines[j]
+        return bool(
+            _FENCE_OPEN_RE.match(line)
+            or _ATX_RE.match(line)
+            or _HR_RE.match(line)
+            or _QUOTE_RE.match(line)
+            or _is_list_item(line)
+            or table_start(j)
+        )
+
+    blocks: list[tuple[int, int]] = []
+    n = len(lines)
+    i = 0
+    while i < n:
+        if not lines[i].strip():
+            i += 1
+            continue
+        start = i
+        line = lines[i]
+        if _FENCE_OPEN_RE.match(line):
+            marker = _FENCE_OPEN_RE.match(line).group(1)
+            i += 1
+            while i < n:
+                close = _FENCE_CLOSE_RE.match(lines[i])
+                i += 1
+                if (
+                    close
+                    and close.group(1)[0] == marker[0]
+                    and len(close.group(1)) >= len(marker)
+                ):
+                    break
+        elif _ATX_RE.match(line):
+            i += 1
+        elif _HR_RE.match(line):
+            i += 1
+        elif _QUOTE_RE.match(line):
+            i += 1
+            while i < n and lines[i].strip():
+                if i > start and block_start(i) and not _QUOTE_RE.match(lines[i]):
+                    break
+                i += 1
+        elif _is_list_item(line):
+            i += 1
+            while i < n:
+                current = lines[i]
+                if not current.strip():
+                    k = i
+                    while k < n and not lines[k].strip():
+                        k += 1
+                    if (
+                        k < n
+                        and not _HR_RE.match(lines[k])
+                        and (_is_list_item(lines[k]) or _indent_width(lines[k]) >= 2)
+                    ):
+                        i = k
+                        continue
+                    break
+                if i > start and (
+                    _FENCE_OPEN_RE.match(current)
+                    or _ATX_RE.match(current)
+                    or _HR_RE.match(current)
+                    or _QUOTE_RE.match(current)
+                    or table_start(i)
+                ):
+                    break
+                i += 1
+        elif table_start(i):
+            i += 1
+            while i < n and lines[i].strip() and "|" in lines[i]:
+                i += 1
+        else:
+            # Paragrafo (o intestazione setext: la sottolineatura appartiene
+            # al paragrafo che la precede).
+            i += 1
+            while i < n and lines[i].strip():
+                if block_start(i):
+                    break
+                if i < n and _SETEXT_RE.match(lines[i]):
+                    i += 1
+                    break
+                i += 1
+        blocks.append((starts[start], end_of(i)))
+    return blocks
+
+
+def _is_delim_line(line: str) -> bool:
+    cells = _parse_row(line)[1]
+    return cells is not None and _is_table_delimiter(cells)
+
+
+def _is_list_item(line: str) -> bool:
+    return bool(_LIST_RE.match(line))
+
+
+def _indent_width(line: str) -> int:
+    return len(line) - len(line.lstrip(" "))
+
+
+def content_children(html_doc: str) -> list[_HtmlNode]:
+    """Nodi figli del <div class="content"> del documento dell'anteprima."""
+    root = _parse_html(html_doc)
+    for node in _find_all(root, "div"):
+        if "content" in node.classes:
+            return [c for c in node.children if isinstance(c, _HtmlNode)]
+    return []
+
+
+def _is_whole_cell(text: str, start: int, end: int) -> bool:
+    """True se lo span coincide con l'intera cella di una riga di tabella."""
+    ls = text.rfind("\n", 0, start) + 1
+    before = text[ls:start]
+    if before.strip() and not before.rstrip().endswith("|"):
+        return False
+    le = text.find("\n", end)
+    if le < 0:
+        le = len(text)
+    after = text[end:le]
+    if after.strip() and not after.lstrip().startswith("|"):
+        return False
+    return True
+
+
+def _find_unique_span(
+    text: str, start: int, end: int, needle: str, whole_cell: bool = False
+) -> tuple[int, int] | None:
+    """Match di `needle` nella regione: solo se esatto e univoco."""
+    key = _norm(needle)
+    if not key:
+        return None
+    hay, idx = _norm_with_map(text[start:end])
+    found: tuple[int, int] | None = None
+    pos = hay.find(key)
+    while pos >= 0:
+        s = start + idx[pos]
+        e = start + idx[pos + len(key) - 1] + 1
+        if not whole_cell or _is_whole_cell(text, s, e):
+            if found is not None:
+                return None  # ambiguo: meglio non scrivere
+            found = (s, e)
+        pos = hay.find(key, pos + 1)
+    return found
+
+
+def _match_region(
+    md_text: str, regions: list[tuple[int, int]], node: _HtmlNode, pointer: int
+) -> int | None:
+    """Prima regione sorgente (da `pointer` in poi) che produce `node`."""
+    key = _norm(_md_blocks([node]))
+    if not key.strip():
+        return None
+    for r in range(pointer, len(regions)):
+        a, b = regions[r]
+        hay = _norm(md_text[a:b])
+        if hay == key or (len(key) >= 3 and key in hay) or (
+            len(hay) >= 8 and hay in key
+        ):
+            return r
+    # Fallback: render della regione (intestazioni setext, HTML grezzo, …)
+    for r in range(pointer, len(regions)):
+        a, b = regions[r]
+        hay = _norm(md_text[a:b])
+        if abs(len(hay) - len(key)) > max(24, len(key)):
+            continue  # lunghezze incompatibili: non vale la pena renderizzare
+        if _norm(_md_blocks(_parse_html(_render_md(md_text[a:b])).children)) == key:
+            return r
+    return None
+
+
+def locate_preview_edit(
+    md_text: str, html_doc: str, top_idx: int, orig_html: str
+) -> tuple[int, int] | None:
+    """Intervallo del sorgente corrispondente al blocco modificato.
+
+    Due fasi: (1) la regione sorgente che produce il nodo `top_idx` (il
+    contenitore di primo livello del blocco cliccato) nell'HTML mostrato;
+    (2) dentro la regione, le righe che corrispondono al frammento originale.
+    Ritorna None se la corrispondenza non è univoca: meglio non scrivere.
+    """
+    nodes = content_children(html_doc)
+    regions = split_source_blocks(md_text)
+    if not regions:
+        return None
+    region_idx = None
+    if 0 <= top_idx < len(nodes):
+        pointer = 0
+        for i in range(top_idx + 1):
+            found = _match_region(md_text, regions, nodes[i], pointer)
+            if found is not None:
+                pointer = found
+                if i == top_idx:
+                    region_idx = found
+    if region_idx is None:
+        # Nodo non mappato: unica speranza, una ricerca nel documento.
+        return _find_span(md_text, 0, len(md_text), orig_html)
+    a, b = regions[region_idx]
+    # Tag del blocco originale: determina se va riscritto per intero.
+    elems = [c for c in _parse_html(orig_html).children if isinstance(c, _HtmlNode)]
+    tag = elems[0].tag if len(elems) == 1 else ""
+    # Tag che devono essere riscritti per intero (la forma dipende dal tag:
+    # citazioni, liste, tabelle, blocchi di codice… hanno marker di riga).
+    if tag not in ("pre", "blockquote", "table", "ul", "ol", "dl", "div", "hr"):
+        span = _find_unique_span(md_text, a, b, orig_html)
+        if span is None:
+            # Testo del blocco (funge da "chiave" quando l'HTML ha tag: la
+            # regione contiene la sorgente, non l'HTML renderizzato).
+            span = _find_unique_span(
+                md_text, a, b, _plain_text(orig_html), whole_cell=(tag in ("td", "th"))
+            )
+        if span is not None:
+            return span
+    # La regione è per intero il blocco modificato (es. intestazione setext).
+    if _plain_text(_render_md(md_text[a:b])) == _plain_text(orig_html):
+        return a, b
+    return None
+
+
 _MONO = (
     'ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, '
     '"Liberation Mono", monospace'
@@ -700,6 +1435,28 @@ def _prefs_css(prefs: ViewPrefs | None) -> str:
     return "\n".join(rules)
 
 
+# CSS per la modalità "correzione rapida" in anteprima (doppio click).
+EDIT_CSS = """
+.mdv-editing [contenteditable="true"] {
+  outline: 2px solid #1f6feb;
+  outline-offset: 3px;
+  border-radius: 3px;
+}
+.mdv-edit-hint {
+  position: absolute;
+  z-index: 2147483647;
+  background: #1f6feb;
+  color: #ffffff;
+  font: 12px/1.4 system-ui, sans-serif;
+  padding: 3px 8px;
+  border-radius: 4px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, .35);
+  pointer-events: none;
+  white-space: nowrap;
+}
+"""
+
+
 def preview_css(dark: bool, prefs: ViewPrefs | None = None) -> str:
     """CSS dell'anteprima: tema + stili Pygments + preferenze utente."""
     theme = DARK_PREVIEW_CSS if dark else LIGHT_PREVIEW_CSS
@@ -713,8 +1470,209 @@ def preview_css(dark: bool, prefs: ViewPrefs | None = None) -> str:
     # Gli override devono venire dopo le regole di Pygments.
     return (
         theme + "\n" + pyg + "\n" + _highlight_overrides(dark)
-        + "\n" + _prefs_css(prefs)
+        + "\n" + _prefs_css(prefs) + "\n" + EDIT_CSS
     )
+
+
+# JavaScript della modalità correzione rapida: doppio click su un blocco lo
+# rende editabile in place; Enter salva, Esc annulla, click fuori salva.
+# I messaggi arrivano in Python via console.log con il prefisso "__MDV__".
+PREVIEW_EDIT_JS = r"""
+(function () {
+  "use strict";
+  if (window.__mdvEditInstalled) { return; }
+  window.__mdvEditInstalled = true;
+
+  var editing = null;   /* {root, idx, origOuter, origInner} */
+  var hintEl = null;
+  var linkTimer = null;
+  var WORD_RE = /[\p{L}\p{N}_]/u;
+
+  function send(obj) {
+    try { console.log("__MDV__" + JSON.stringify(obj)); } catch (e) {}
+  }
+
+  function contentEl() { return document.querySelector(".content"); }
+
+  function topInfo(el) {
+    var content = contentEl();
+    if (!content || !content.contains(el)) { return null; }
+    var node = el;
+    while (node.parentElement && node.parentElement !== content) {
+      node = node.parentElement;
+    }
+    if (node.parentElement !== content) { return null; }
+    var kids = content.children;
+    for (var i = 0; i < kids.length; i++) {
+      if (kids[i] === node) { return { node: node, idx: i }; }
+    }
+    return null;
+  }
+
+  function editTarget(el) {
+    if (!el) { return null; }
+    if (el.nodeType !== 1) { el = el.parentElement; }
+    if (!el || !el.closest) { return null; }
+    var bq = el.closest("blockquote, .footnote");
+    if (bq) { return bq; }
+    var cell = el.closest("td, th");
+    if (cell) { return cell; }
+    if (el.closest("table")) { return null; }
+    var li = el.closest("li");
+    if (li && li.parentElement &&
+        (li.parentElement.tagName === "UL" || li.parentElement.tagName === "OL")) {
+      return li.parentElement;
+    }
+    return el.closest("p,h1,h2,h3,h4,h5,h6,pre,dt,dd");
+  }
+
+  function showHint(root) {
+    hideHint();
+    var h = document.createElement("div");
+    h.className = "mdv-edit-hint";
+    h.textContent = "Enter salva \u00b7 Esc annulla \u00b7 click fuori salva";
+    document.body.appendChild(h);
+    var r = root.getBoundingClientRect();
+    var hr = h.getBoundingClientRect();
+    var top = r.top + window.scrollY - hr.height - 6;
+    if (top < window.scrollY + 4) { top = r.bottom + window.scrollY + 6; }
+    var left = r.left + window.scrollX;
+    var max = document.documentElement.clientWidth - hr.width - 8;
+    if (left > max) { left = max; }
+    if (left < 8) { left = 8; }
+    h.style.top = top + "px";
+    h.style.left = left + "px";
+    hintEl = h;
+  }
+
+  function hideHint() {
+    if (hintEl && hintEl.parentNode) { hintEl.parentNode.removeChild(hintEl); }
+    hintEl = null;
+  }
+
+  function selectWord(ev) {
+    if (!ev || typeof ev.clientX !== "number") { return; }
+    var range = null;
+    if (document.caretRangeFromPoint) {
+      range = document.caretRangeFromPoint(ev.clientX, ev.clientY);
+    }
+    if (!range) { return; }
+    var node = range.startContainer;
+    if (!node || node.nodeType !== 3 || !editing.root.contains(node)) { return; }
+    var text = node.nodeValue;
+    var off = Math.min(range.startOffset, text.length);
+    var s = off, e = off;
+    while (s > 0 && WORD_RE.test(text.charAt(s - 1))) { s--; }
+    while (e < text.length && WORD_RE.test(text.charAt(e))) { e++; }
+    if (s === e) { return; }  /* la selezione nativa del doppio click resta */
+    var sel = window.getSelection();
+    if (!sel) { return; }
+    var r = document.createRange();
+    r.setStart(node, s);
+    r.setEnd(node, e);
+    sel.removeAllRanges();
+    sel.addRange(r);
+  }
+
+  function stopEdit() {
+    if (!editing) { return null; }
+    var e = editing;
+    editing = null;
+    e.root.removeAttribute("contenteditable");
+    document.body.classList.remove("mdv-editing");
+    hideHint();
+    return e;
+  }
+
+  function commit() {
+    var e = stopEdit();
+    if (!e) { return; }
+    send({ t: "commit", idx: e.idx, orig: e.origOuter, new: e.root.outerHTML });
+  }
+
+  function cancel() {
+    var e = stopEdit();
+    if (!e) { return; }
+    e.root.innerHTML = e.origInner;
+    send({ t: "cancel" });
+  }
+
+  function startEdit(root, ev) {
+    var info = topInfo(root);
+    if (!info) { return; }
+    editing = {
+      root: root,
+      idx: info.idx,
+      origOuter: root.outerHTML,
+      origInner: root.innerHTML
+    };
+    root.setAttribute("contenteditable", "true");
+    document.body.classList.add("mdv-editing");
+    try { document.execCommand("defaultParagraphSeparator", false, "p"); } catch (e) {}
+    showHint(root);
+    selectWord(ev);
+    send({ t: "enter", idx: info.idx });
+  }
+
+  document.addEventListener("dblclick", function (ev) {
+    if (linkTimer) { clearTimeout(linkTimer); linkTimer = null; }
+    if (editing) { ev.preventDefault(); ev.stopPropagation(); return; }
+    var root = editTarget(ev.target);
+    if (!root) { return; }
+    ev.preventDefault();
+    ev.stopPropagation();
+    startEdit(root, ev);
+  }, true);
+
+  document.addEventListener("mousedown", function (ev) {
+    if (!editing) { return; }
+    if (ev.button === 2) { return; }  /* menu contestuale */
+    if (editing.root.contains(ev.target)) { return; }
+    commit();
+  }, true);
+
+  document.addEventListener("click", function (ev) {
+    var a = ev.target && ev.target.closest ? ev.target.closest("a") : null;
+    if (!a) { return; }
+    var href = a.getAttribute("href") || "";
+    if (editing) { ev.preventDefault(); ev.stopPropagation(); return; }
+    if (/^(https?|ftp|mailto):/i.test(href)) {
+      /* ritarda: un doppio click sul link deve rimanere una correzione */
+      ev.preventDefault();
+      ev.stopPropagation();
+      if (linkTimer) { clearTimeout(linkTimer); }
+      linkTimer = setTimeout(function () {
+        linkTimer = null;
+        send({ t: "link", href: href });
+      }, 300);
+    }
+  }, true);
+
+  document.addEventListener("keydown", function (ev) {
+    if (!editing) { return; }
+    var key = ev.key;
+    if (key === "Escape") {
+      ev.preventDefault();
+      ev.stopPropagation();
+      cancel();
+    } else if (key === "Enter" && !ev.shiftKey) {
+      ev.preventDefault();
+      ev.stopPropagation();
+      commit();
+    } else if ((ev.ctrlKey || ev.metaKey) &&
+               (key === "s" || key === "S" || key === "p" || key === "P")) {
+      ev.preventDefault();
+      ev.stopPropagation();
+      if (key === "s" || key === "S") { commit(); }
+    }
+  }, true);
+
+  window.addEventListener("blur", function () {
+    if (linkTimer) { clearTimeout(linkTimer); linkTimer = null; }
+    commit();
+  });
+})();
+"""
 
 
 def build_html(
@@ -722,8 +1680,14 @@ def build_html(
     title: str,
     dark: bool,
     prefs: ViewPrefs | None = None,
+    *,
+    editable: bool = False,
 ) -> str:
-    """Converte il testo Markdown in un documento HTML completo."""
+    """Converte il testo Markdown in un documento HTML completo.
+
+    Con `editable=True` inietta il JS della correzione rapida in anteprima
+    (serve solo a QWebEngineView: il fallback QTextBrowser lo ignora).
+    """
     body = markdown.markdown(
         md_text,
         extensions=MD_EXTENSIONS,
@@ -731,6 +1695,7 @@ def build_html(
     )
     css = preview_css(dark, prefs)
     safe_title = html_lib.escape(title)
+    script = f"<script>\n{PREVIEW_EDIT_JS}\n</script>\n" if editable else ""
     return (
         "<!DOCTYPE html>\n"
         '<html lang="it">\n'
@@ -740,7 +1705,7 @@ def build_html(
         f"<title>{safe_title}</title>\n"
         f"<style>{css}</style>\n"
         "</head>\n"
-        f'<body><div class="content">{body}</div></body>\n'
+        f'<body><div class="content">{body}</div>\n{script}</body>\n'
         "</html>\n"
     )
 
@@ -921,13 +1886,37 @@ class MarkdownHighlighter(QSyntaxHighlighter):
 #  Widget di anteprima (WebEngine con fallback su QTextBrowser)
 # --------------------------------------------------------------------------- #
 
+class _PreviewPage(QWebEnginePage):
+    """Pagina che intercetta i messaggi JS della correzione rapida."""
+
+    message = Signal(str)  # payload dopo il prefisso "__MDV__"
+
+    def javaScriptConsoleMessage(self, level, message, line, source_id):  # noqa: N802
+        if isinstance(message, str) and message.startswith("__MDV__"):
+            self.message.emit(message[len("__MDV__"):])
+
+    def acceptNavigationRequest(self, url, nav_type, is_main_frame):  # noqa: N802
+        if nav_type == QWebEnginePage.NavigationType.NavigationTypeLinkClicked:
+            if url.isFragmentOnly():
+                return True  # note a piè di pagina: resta in pagina
+            scheme = url.scheme().lower()
+            if scheme in ("http", "https", "ftp", "mailto"):
+                QDesktopServices.openUrl(url)
+                return False
+            return False  # mai fuori dall'anteprima (file, javascript, …)
+        return super().acceptNavigationRequest(url, nav_type, is_main_frame)
+
+
 class PreviewWidget(QWidget):
     """Mostra l'HTML renderizzato: QWebEngineView se possibile, altrimenti QTextBrowser."""
+
+    message = Signal(str)  # messaggi JS -> Python (bridge "console")
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._web = None
         self._text = None
+        self._pending_scroll = None
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
@@ -935,6 +1924,10 @@ class PreviewWidget(QWidget):
         if HAVE_WEBENGINE:
             try:
                 self._web = QWebEngineView(self)
+                page = _PreviewPage(self._web)
+                page.message.connect(self.message.emit)
+                page.loadFinished.connect(self._restore_scroll)
+                self._web.setPage(page)
                 layout.addWidget(self._web)
             except Exception:
                 self._web = None
@@ -951,10 +1944,34 @@ class PreviewWidget(QWidget):
 
     def set_html(self, html: str, base_url=None) -> None:
         if self._web is not None:
+            # Ricaricare il documento azzera lo scroll: lo salvo prima e lo
+            # ripristino a caricamento avvenuto (vedi _restore_scroll).
+            try:
+                pos = self._web.page().scrollPosition()
+                self._pending_scroll = (pos.x(), pos.y())
+            except Exception:
+                self._pending_scroll = None
             base = base_url if base_url is not None and base_url.isValid() else QUrl("about:blank")
             self._web.setHtml(html, base)
         else:
             self._text.setHtml(html)
+
+    def _restore_scroll(self, ok: bool) -> None:
+        pos, self._pending_scroll = self._pending_scroll, None
+        if not ok or pos is None or self._web is None:
+            return
+        x, y = pos
+        if not x and not y:
+            return
+        js = (
+            "requestAnimationFrame(function(){window.scrollTo(%r, %r);"
+            "requestAnimationFrame(function(){window.scrollTo(%r, %r);});});"
+            % (x, y, x, y)
+        )
+        try:
+            self._web.page().runJavaScript(js)
+        except Exception:
+            pass
 
     def set_dark(self, dark: bool) -> None:
         bg = "#0d1117" if dark else "#ffffff"
@@ -1345,6 +2362,9 @@ class MarkdownTab(QWidget):
     notice = Signal(str)                 # messaggio per la barra di stato
     modified_changed = Signal(bool)      # stato "modificato" cambiato
 
+    # Hint una tantum alla prima anteprima visibile (condiviso fra le tab).
+    _hint_shown = False
+
     def __init__(
         self,
         path: str | None = None,
@@ -1359,6 +2379,11 @@ class MarkdownTab(QWidget):
         self._dark = dark
         self._prefs = prefs if prefs is not None else ViewPrefs()
         self._loading = False
+
+        # Correzione rapida in anteprima (doppio click)
+        self._preview_editing = False   # un blocco è editabile in place
+        self._pending_reload = False    # refresh su disco differito
+        self._last_html = ""            # documento mostrato (per localizzare)
 
         # Sorgente
         self.editor = QPlainTextEdit()
@@ -1384,6 +2409,7 @@ class MarkdownTab(QWidget):
 
         # Anteprima
         self.preview = PreviewWidget()
+        self.preview.message.connect(self._on_preview_message)
 
         # Vista split
         self.splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -1446,8 +2472,8 @@ class MarkdownTab(QWidget):
         return self.editor.document().isModified()
 
     def _on_text_changed(self) -> None:
-        if self._loading:
-            return
+        if self._loading or self._preview_editing:
+            return  # durante la correzione in anteprima il render è differito
         self._render_timer.start()
 
     # -- I/O ---------------------------------------------------------------- #
@@ -1536,6 +2562,12 @@ class MarkdownTab(QWidget):
         if self.path not in self.watcher.files() and os.path.isfile(self.path):
             self.watcher.addPath(self.path)
 
+        if self._preview_editing:
+            # Un blocco è editabile in anteprima: il refresh viene gestito a
+            # correzione conclusa (_flush_pending_reload).
+            self._pending_reload = True
+            return
+
         if not os.path.exists(self.path):
             self.notice.emit(f"{name} è stato rimosso dal disco")
             return
@@ -1554,17 +2586,106 @@ class MarkdownTab(QWidget):
     # -- anteprima ---------------------------------------------------------- #
     def render(self) -> None:
         self._render_timer.stop()
+        if self._preview_editing:
+            return  # non ricaricare mentre l'utente corregge un blocco
         html = build_html(
             self.editor.toPlainText(),
             self.display_name,
             self._dark,
             self._prefs,
+            editable=self.preview.is_web,
         )
+        self._last_html = html
         if self.path:
             base = QUrl.fromLocalFile(os.path.dirname(self.path) + os.sep)
         else:
             base = QUrl()
         self.preview.set_html(html, base)
+        self._maybe_hint()
+
+    def showEvent(self, event) -> None:  # noqa: N802 (API Qt)
+        super().showEvent(event)
+        self._maybe_hint()
+
+    def _maybe_hint(self) -> None:
+        """Barra di stato: un solo avviso sul doppio click in anteprima."""
+        if MarkdownTab._hint_shown or not self.preview.is_web:
+            return
+        if not self.isVisible() or not self.preview.isVisible():
+            return
+        MarkdownTab._hint_shown = True
+        self.notice.emit("Doppio click su un paragrafo per correggerlo")
+
+    # -- correzione rapida in anteprima ------------------------------------- #
+    def _on_preview_message(self, raw: str) -> None:
+        try:
+            msg = json.loads(raw)
+        except (TypeError, ValueError):
+            return
+        kind = msg.get("t")
+        if kind == "enter":
+            self._preview_editing = True
+            self._render_timer.stop()
+        elif kind in ("commit", "cancel"):
+            self._preview_editing = False
+            try:
+                if kind == "commit":
+                    self._apply_preview_edit(
+                        int(msg.get("idx", -1)),
+                        str(msg.get("orig", "")),
+                        str(msg.get("new", "")),
+                    )
+                else:
+                    self.render()  # JS ha già ripristinato il DOM
+            finally:
+                self._flush_pending_reload()
+        elif kind == "link":
+            href = str(msg.get("href", ""))
+            if href:
+                QDesktopServices.openUrl(QUrl(href))
+
+    def _apply_preview_edit(self, idx: int, orig: str, new: str) -> None:
+        """Riscrive nel sorgente solo il blocco corretto in anteprima."""
+        text = self.editor.toPlainText()
+        span = locate_preview_edit(text, self._last_html, idx, orig)
+        if span is None:
+            self.notice.emit("Correzione annullata: blocco non individuato")
+            self.render()
+            return
+        a, b = span
+        # Forma del sostituto: per intero (marker di riga) o inline.
+        regions = [r for r in split_source_blocks(text) if r[0] <= a and b <= r[1]]
+        whole = bool(regions) and regions[0] == (a, b)
+        replacement = html_to_markdown(new) if whole else _inline_markdown(new)
+        if not whole:
+            # Righe successive alla prima: rientro come nella sorgente.
+            line_start = text.rfind("\n", 0, a) + 1
+            pad = " " * (a - line_start)
+            if pad and "\n" in replacement:
+                lines = replacement.split("\n")
+                replacement = lines[0] + "\n" + "\n".join(
+                    (pad + ln) if ln.strip() else ln for ln in lines[1:]
+                )
+        old = text[a:b]
+        if replacement == old:
+            self.render()
+            return
+        cursor = self.editor.textCursor()
+        cursor.beginEditBlock()
+        cursor.setPosition(a)
+        cursor.setPosition(b, QTextCursor.MoveMode.KeepAnchor)
+        cursor.insertText(replacement)
+        cursor.endEditBlock()
+        self.render()
+        self.notice.emit("Correzione salvata nella sorgente")
+
+    def _flush_pending_reload(self) -> None:
+        """Applica il refresh su disco differito durante la correzione."""
+        if not self._pending_reload:
+            return
+        self._pending_reload = False
+        if self.path:
+            self._on_file_changed(self.path)
 
     # -- temi / preferenze / layout ----------------------------------------- #
     def set_dark(self, dark: bool) -> None:
