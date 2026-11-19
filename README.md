@@ -1,4 +1,4 @@
-# mdv — Markdown viewer
+# mde — Markdown editor and viewer
 
 Reader GUI per file Markdown con visualizzazione a **tab**, scritto in Python con **PyQt6**.
 
