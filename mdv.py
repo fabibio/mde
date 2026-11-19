@@ -36,6 +36,7 @@ import markdown
 from PyQt6.QtCore import (
     QEvent,
     QFileSystemWatcher,
+    QRectF,
     QSettings,
     Qt,
     QRegularExpression,
@@ -53,6 +54,7 @@ from PyQt6.QtGui import (
     QFont,
     QFontDatabase,
     QKeySequence,
+    QPainter,
     QPalette,
     QShortcut,
     QSyntaxHighlighter,
@@ -116,7 +118,7 @@ MD_EXTENSION_CONFIGS = {
 # --------------------------------------------------------------------------- #
 
 DEFAULT_PREVIEW_SIZE = 15  # px, come nel CSS predefinito dell'anteprima
-DEFAULT_TABLE_MAX_WIDTH = 80  # caratteri: righe di tabella più lunghe restano inalterate
+DEFAULT_TABLE_MAX_WIDTH = 80  # caratteri: oltre il limite i separatori restano inalterati
 TABLE_MIN_COL_WIDTH = 3      # minima larghezza di una colonna (serve per "---")
 
 
@@ -129,6 +131,7 @@ class ViewPrefs:
     src_size: int = 0          # 0 = dimensione predefinita (px)
     src_color: str = ""        # "" = colore del tema
     src_syntax: bool = True    # colorazione della sintassi della sorgente
+    src_line_wrap: bool = True # a capo automatico (line folding) nella sorgente
     prev_family: str = ""      # "" = stack di font CSS predefinito
     prev_size: int = DEFAULT_PREVIEW_SIZE
     prev_color: str = ""       # "" = colore del tema
@@ -190,6 +193,7 @@ def load_prefs() -> ViewPrefs:
     p.src_family = s.value("source/font_family", "", type=str) or ""
     p.src_color = s.value("source/font_color", "", type=str) or ""
     p.src_syntax = s.value("source/syntax", True, type=bool)
+    p.src_line_wrap = s.value("source/line_wrap", True, type=bool)
     p.prev_family = s.value("preview/font_family", "", type=str) or ""
     p.prev_color = s.value("preview/font_color", "", type=str) or ""
 
@@ -231,11 +235,29 @@ def save_prefs(prefs: ViewPrefs) -> None:
     s.setValue("source/font_size", prefs.src_size)
     s.setValue("source/font_color", prefs.src_color)
     s.setValue("source/syntax", prefs.src_syntax)
+    s.setValue("source/line_wrap", prefs.src_line_wrap)
     s.setValue("preview/font_family", prefs.prev_family)
     s.setValue("preview/font_size", prefs.prev_size)
     s.setValue("preview/font_color", prefs.prev_color)
     s.setValue("edit/table_max_width", prefs.table_max_width)
     s.sync()
+
+
+# --------------------------------------------------------------------------- #
+#  Terminatori di riga (LF <-> CRLF)
+# --------------------------------------------------------------------------- #
+
+def detect_line_ending(text: str) -> str:
+    """Rileva il terminatore di riga ('\\r\\n' se presente, altrimenti '\\n')."""
+    return "\r\n" if "\r\n" in text else "\n"
+
+
+def convert_line_endings(text: str, target: str) -> str:
+    """Converte i terminatori di riga di `text` in `target` ('\\n' o '\\r\\n')."""
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    if target == "\r\n":
+        return normalized.replace("\n", "\r\n")
+    return normalized
 
 
 # --------------------------------------------------------------------------- #
@@ -418,31 +440,33 @@ def _pad_cell(content: str, width: int, align: str | None) -> str:
     return content + " " * pad
 
 
-def _render_row(
-    prefix: str, cells: list[str], widths: list[int], aligns: list[str | None]
-) -> str:
-    parts = []
-    for j, width in enumerate(widths):
-        content = cells[j].strip() if j < len(cells) else ""
-        parts.append(" " + _pad_cell(content, width, aligns[j]) + " ")
-    return prefix + "|" + "|".join(parts) + "|"
+def _tail_after_cell(body: str, col_idx: int) -> str:
+    """Restituisce la porzione di `body` dopo il separatore che precede `col_idx`."""
+    target_pipe = col_idx + (1 if body[:1] == "|" else 0)
+    if target_pipe <= 0:
+        return body
+    pipes = 0
+    i, n = 0, len(body)
+    while i < n:
+        if body[i] == "\\" and i + 1 < n:
+            i += 2
+            continue
+        if body[i] == "|":
+            pipes += 1
+            if pipes == target_pipe:
+                return body[i + 1 :]
+        i += 1
+    return ""
 
 
-def _render_delimiter(
-    prefix: str, widths: list[int], aligns: list[str | None]
-) -> str:
-    parts = []
-    for width, align in zip(widths, aligns):
-        if align == "left":
-            text = ":" + "-" * (width - 1)
-        elif align == "right":
-            text = "-" * (width - 1) + ":"
-        elif align == "center":
-            text = ":" + "-" * (width - 2) + ":"
-        else:
-            text = "-" * width
-        parts.append(" " + text + " ")
-    return prefix + "|" + "|".join(parts) + "|"
+def _render_delimiter_cell(width: int, align: str | None) -> str:
+    if align == "left":
+        return ":" + "-" * (width - 1)
+    if align == "right":
+        return "-" * (width - 1) + ":"
+    if align == "center":
+        return ":" + "-" * (width - 2) + ":"
+    return "-" * width
 
 
 def format_table(
@@ -454,9 +478,12 @@ def format_table(
     altrimenti le righe sono quelle originali e il messaggio spiega il motivo.
 
     Corner case gestiti:
-      * righe la cui resa supererebbe `max_width` restano inalterate
-        (prima quelle che non ci starebbero mai, poi — in modo iterativo —
-        quelle che allargano troppo le colonne per tutte le altre);
+      * i separatori di colonna vengono allineati finché non si raggiunge
+        `max_width` (o una cella supera la larghezza della propria colonna),
+        poi il resto della riga viene lasciato inalterato;
+      * le righe con celle molto larghe non allargano le colonne per le altre
+        righe oltre `max_width` (esclusione iterativa dal calcolo delle
+        larghezze);
       * celle mancanti (riga corta) vengono integrate, celle in eccesso
         rispetto alla delimitazione lasciano la riga invariata;
       * '|'-escape-ate ("\\|") non separano le celle;
@@ -501,81 +528,174 @@ def format_table(
         if cells and len(cells) <= ncols:
             renderable.add(i)
 
-    def widths_over(indices: set[int]) -> list[int]:
-        """Larghezze di colonna (min 3) dati gli indici delle righe ammesse."""
-        widths = [TABLE_MIN_COL_WIDTH] * ncols
-        for i in indices:
-            if i == delim_idx:
-                continue  # la delimitazione viene rigenerata: non conta
-            cells = parsed[i][1] or []
-            for j in range(ncols):
+    def solve_for(
+        target_ncols: int,
+    ) -> tuple[list[int], dict[int, int], int] | None:
+        """Calcola (widths, excluded_from, max_prefix) per le prime `target_ncols` colonne."""
+
+        def own_fail_col(idx: int) -> int | None:
+            cells = parsed[idx][1] or []
+            pos = display_width(parsed[idx][0]) + 1
+            for j in range(target_ncols):
                 content = cells[j].strip() if j < len(cells) else ""
-                w = display_width(content)
-                if w > widths[j]:
-                    widths[j] = w
-        return widths
+                w = max(TABLE_MIN_COL_WIDTH, display_width(content))
+                if pos + w + 3 > max_width:
+                    return j
+                pos += w + 3
+            return None
 
-    def fits(widths: list[int]) -> bool:
-        # Tutte le righe renderabili hanno la stessa larghezza finale:
-        # ncols celle + (ncols + 1) barre + 2 spazi per cella.
-        return sum(widths) + 3 * ncols + 1 <= max_width
+        # 1) Righe "impossibili": per ciascuna, prima colonna che supera max_width.
+        excluded_from: dict[int, int] = {}
+        for idx in renderable:
+            if idx == delim_idx:
+                continue
+            fc = own_fail_col(idx)
+            if fc is not None:
+                excluded_from[idx] = fc
 
-    def own_fits(i: int) -> bool:
-        """True se la riga ci starebbe anche da sola (colonne al minimo)."""
-        cells = parsed[i][1] or []
-        widths = [TABLE_MIN_COL_WIDTH] * ncols
-        for j in range(ncols):
-            content = cells[j].strip() if j < len(cells) else ""
-            widths[j] = max(widths[j], display_width(content))
-        return fits(widths)
+        def widths_over(excl: dict[int, int]) -> list[int]:
+            ws = [TABLE_MIN_COL_WIDTH] * target_ncols
+            for idx in renderable:
+                if idx == delim_idx:
+                    continue  # la delimitazione viene rigenerata: non conta
+                limit = excl.get(idx, target_ncols)
+                cells = parsed[idx][1] or []
+                for j in range(limit):
+                    content = cells[j].strip() if j < len(cells) else ""
+                    w = display_width(content)
+                    if w > ws[j]:
+                        ws[j] = w
+            return ws
 
-    # 1) Righe "impossibili": non ci starebbero mai -> inalterate subito.
-    excluded = {
-        i
-        for i in renderable
-        if i != delim_idx and not own_fits(i)
-    }
-
-    # 2) Se il totale supera il limite, togliere la riga che contribuisce
-    #    di più finché non entra (in modo monotono: mai rientri).
-    widths = widths_over(renderable - excluded)
-    while not fits(widths):
-        best, best_key = None, (0, -1)
-        for i in sorted(renderable - excluded - {delim_idx}):
-            gain = sum(widths) - sum(
-                widths_over(renderable - excluded - {i})
+        def max_pref(excl: dict[int, int]) -> int:
+            return max(
+                (
+                    display_width(parsed[idx][0])
+                    for idx in renderable
+                    if excl.get(idx, target_ncols) > 0
+                ),
+                default=0,
             )
-            # Preferenza alle righe di corpo (indice più alto) a parità di gain.
-            key = (gain, i)
-            if gain > 0 and key > best_key:
-                best, best_key = i, key
-        if best is None:
-            break
-        excluded.add(best)
-        widths = widths_over(renderable - excluded)
 
-    if not fits(widths):
+        def fits(ws: list[int], pref_w: int) -> bool:
+            # Prime target_ncols colonne: prefisso + '|' iniziale + celle + '|' finali.
+            return pref_w + 1 + sum(ws) + 3 * target_ncols <= max_width
+
+        # 2) Se il totale supera il limite, ridurre la colonna più vantaggiosa
+        #    (escludendo dalla colonna in poi le righe al massimo corrente).
+        ws = widths_over(excluded_from)
+        pref_w = max_pref(excluded_from)
+        while not fits(ws, pref_w):
+            best_cand: dict[int, int] | None = None
+            best_key = (0, -1)
+            cur_sum = sum(ws) + pref_w
+            for col in range(target_ncols):
+                max_w = ws[col]
+                if max_w <= TABLE_MIN_COL_WIDTH:
+                    continue
+                cand = dict(excluded_from)
+                changed = False
+                for idx in renderable - {delim_idx}:
+                    cur_limit = cand.get(idx, target_ncols)
+                    if col >= cur_limit:
+                        continue
+                    cells = parsed[idx][1] or []
+                    content = cells[col].strip() if col < len(cells) else ""
+                    if display_width(content) == max_w:
+                        cand[idx] = col
+                        changed = True
+                if not changed:
+                    continue
+                cand_ws = widths_over(cand)
+                cand_pref = max_pref(cand)
+                gain = cur_sum - (sum(cand_ws) + cand_pref)
+                # Preferenza: maggior gain, poi colonna più a destra.
+                key = (gain, col)
+                if gain > 0 and key > best_key:
+                    best_cand, best_key = cand, key
+            if best_cand is None:
+                break
+            excluded_from = best_cand
+            ws = widths_over(excluded_from)
+            pref_w = max_pref(excluded_from)
+
+        if not fits(ws, pref_w):
+            return None
+        has_full_row = any(
+            excluded_from.get(idx, target_ncols) == target_ncols
+            for idx in renderable
+            if idx != delim_idx
+        )
+        if not has_full_row:
+            return None
+        return ws, excluded_from, pref_w
+
+    solution: tuple[list[int], dict[int, int], int] | None = None
+    fallback: tuple[list[int], dict[int, int], int] | None = None
+    for target_ncols in range(ncols, 0, -1):
+        res = solve_for(target_ncols)
+        if res is None:
+            continue
+        _ws, excluded_from, _pref_w = res
+        if excluded_from.get(delim_idx - 1, target_ncols) == target_ncols:
+            solution = res
+            break
+        if fallback is None:
+            fallback = res
+
+    if solution is None:
+        solution = fallback
+    if solution is None:
         return original, (
             f"la tabella supera la larghezza massima di {max_width} caratteri"
         )
 
-    # Prefissi (indentazione / '>') allineati sulla stessa colonna.
-    rendered = renderable - excluded
-    max_prefix = max(
-        (display_width(parsed[i][0]) for i in rendered), default=0
-    )
+    widths, _excluded, max_prefix = solution
+    aligned_cols = len(widths)
 
     out: list[str] = []
     for i, line in enumerate(original):
-        if i not in rendered:
-            out.append(line)  # invariata (fuori tabella, non allineabile, esclusa)
+        if i not in renderable:
+            out.append(line)  # invariata (fuori tabella o troppe celle)
             continue
         prefix, cells = parsed[i]
-        prefix = prefix + " " * (max_prefix - display_width(prefix))
+        aligned_prefix = prefix + " " * max(0, max_prefix - display_width(prefix))
+        pos = display_width(aligned_prefix) + 1  # dopo il '|' iniziale
+        parts: list[str] = []
+        k = 0
         if i == delim_idx:
-            out.append(_render_delimiter(prefix, widths, aligns))
+            for j in range(aligned_cols):
+                w = widths[j]
+                if pos + w + 3 > max_width:
+                    break
+                parts.append(" " + _render_delimiter_cell(w, aligns[j]) + " ")
+                pos += w + 3
+                k = j + 1
         else:
-            out.append(_render_row(prefix, cells or [], widths, aligns))
+            row_cells = cells or []
+            for j in range(aligned_cols):
+                w = widths[j]
+                content = row_cells[j].strip() if j < len(row_cells) else ""
+                if display_width(content) > w or pos + w + 3 > max_width:
+                    break
+                parts.append(" " + _pad_cell(content, w, aligns[j]) + " ")
+                pos += w + 3
+                k = j + 1
+
+        if k == 0:
+            out.append(line)
+        elif k == ncols:
+            out.append(aligned_prefix + "|" + "|".join(parts) + "|")
+        else:
+            expanded = line.expandtabs(4)
+            body = expanded[len(prefix) :]
+            out.append(
+                aligned_prefix
+                + "|"
+                + "|".join(parts)
+                + "|"
+                + _tail_after_cell(body, k)
+            )
     return out, None
 
 
@@ -2148,7 +2268,10 @@ class FindReplaceBar(QWidget):
     def close_bar(self) -> None:
         """Nasconde la barra e toglie l'evidenziazione dei risultati."""
         self.hide()
-        self.editor.setExtraSelections([])
+        if hasattr(self.editor, "set_search_selections"):
+            self.editor.set_search_selections([])
+        else:
+            self.editor.setExtraSelections([])
         self.closed.emit()
 
     # -- ricerca -------------------------------------------------------------- #
@@ -2223,7 +2346,10 @@ class FindReplaceBar(QWidget):
             cursor.setPosition(end, QTextCursor.MoveMode.KeepAnchor)
             sel.cursor = cursor
             selections.append(sel)
-        self.editor.setExtraSelections(selections)
+        if hasattr(self.editor, "set_search_selections"):
+            self.editor.set_search_selections(selections)
+        else:
+            self.editor.setExtraSelections(selections)
 
     def _update_count(self) -> None:
         if not self.find_edit.text():
@@ -2353,6 +2479,432 @@ class FindReplaceBar(QWidget):
 
 
 # --------------------------------------------------------------------------- #
+#  Editor sorgente con selezione rettangolare
+# --------------------------------------------------------------------------- #
+
+class SourceEditor(QPlainTextEdit):
+    """QPlainTextEdit con supporto alla selezione rettangolare (a colonne)."""
+
+    rect_selection_changed = Signal(bool)
+    rect_mode_changed = Signal(bool)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._rect_active = False
+        self._rect_dragging = False
+        self._rect_mode = False
+        self._rect_anchor: tuple[int, int] = (0, 0)
+        self._rect_cursor: tuple[int, int] = (0, 0)
+        self._search_selections: list[QTextEdit.ExtraSelection] = []
+
+    # -- stato e coordinate -------------------------------------------------- #
+    def has_rect_selection(self) -> bool:
+        return self._rect_active
+
+    def has_any_selection(self) -> bool:
+        return self._rect_active or self.textCursor().hasSelection()
+
+    def rect_mode(self) -> bool:
+        return self._rect_mode
+
+    def set_rect_mode(self, enabled: bool) -> None:
+        if self._rect_mode == enabled:
+            return
+        self._rect_mode = enabled
+        self.rect_mode_changed.emit(enabled)
+
+    def _rect_bounds(self) -> tuple[int, int, int, int]:
+        r1, c1 = self._rect_anchor
+        r2, c2 = self._rect_cursor
+        return min(r1, r2), max(r1, r2), min(c1, c2), max(c1, c2)
+
+    def clear_rect_selection(self) -> None:
+        if not self._rect_active:
+            return
+        self._rect_active = False
+        self._rect_dragging = False
+        self._refresh_extra_selections()
+        self.viewport().update()
+        self.rect_selection_changed.emit(False)
+
+    def _start_or_update_rect(
+        self, anchor: tuple[int, int], cur: tuple[int, int]
+    ) -> None:
+        was_active = self._rect_active
+        self._rect_active = True
+        self._rect_anchor = anchor
+        self._rect_cursor = cur
+        # Azzera l'eventuale selezione lineare standard senza perdere la posizione.
+        c = self.textCursor()
+        if c.hasSelection():
+            c.clearSelection()
+            self.setTextCursor(c)
+        self._refresh_extra_selections()
+        self.viewport().update()
+        if not was_active:
+            self.rect_selection_changed.emit(True)
+
+    def _pos_to_block_col(self, pos) -> tuple[int, int]:
+        cursor = self.cursorForPosition(pos)
+        block = cursor.block()
+        blk_num = block.blockNumber()
+        col = cursor.positionInBlock()
+        c_rect = self.cursorRect(cursor)
+        char_w = max(1.0, float(self.fontMetrics().horizontalAdvance(" ")))
+        if pos.x() > c_rect.right():
+            col += max(0, round((pos.x() - c_rect.left()) / char_w))
+        return blk_num, max(0, col)
+
+    def _set_cursor_to(self, blk_num: int, col: int) -> None:
+        doc = self.document()
+        blk_num = max(0, min(blk_num, doc.blockCount() - 1))
+        block = doc.findBlockByNumber(blk_num)
+        c = QTextCursor(block)
+        c.setPosition(block.position() + min(col, len(block.text())))
+        self.setTextCursor(c)
+        self.ensureCursorVisible()
+
+    # -- evidenziazioni e disegno -------------------------------------------- #
+    def set_search_selections(
+        self, selections: list[QTextEdit.ExtraSelection]
+    ) -> None:
+        self._search_selections = list(selections)
+        self._refresh_extra_selections()
+
+    def _refresh_extra_selections(self) -> None:
+        selections = list(self._search_selections)
+        if self._rect_active:
+            top_blk, bottom_blk, left_col, right_col = self._rect_bounds()
+            if left_col < right_col:
+                pal = self.palette()
+                fmt = QTextCharFormat()
+                fmt.setBackground(pal.brush(QPalette.ColorRole.Highlight))
+                fmt.setForeground(pal.brush(QPalette.ColorRole.HighlightedText))
+                doc = self.document()
+                for blk_num in range(top_blk, bottom_blk + 1):
+                    block = doc.findBlockByNumber(blk_num)
+                    if not block.isValid():
+                        continue
+                    line_len = len(block.text())
+                    if line_len <= left_col:
+                        continue
+                    end_col = min(right_col, line_len)
+                    c = QTextCursor(block)
+                    c.setPosition(block.position() + left_col)
+                    c.setPosition(
+                        block.position() + end_col,
+                        QTextCursor.MoveMode.KeepAnchor,
+                    )
+                    sel = QTextEdit.ExtraSelection()
+                    sel.format = fmt
+                    sel.cursor = c
+                    selections.append(sel)
+        self.setExtraSelections(selections)
+
+    def paintEvent(self, event) -> None:  # noqa: N802 (API Qt)
+        super().paintEvent(event)
+        if not self._rect_active:
+            return
+        top_blk, bottom_blk, left_col, right_col = self._rect_bounds()
+        doc = self.document()
+        char_w = max(1.0, float(self.fontMetrics().horizontalAdvance(" ")))
+        hl = self.palette().color(QPalette.ColorRole.Highlight)
+        fill = QColor(hl)
+        fill.setAlpha(70)
+        painter = QPainter(self.viewport())
+        offset = self.contentOffset()
+        vp_h = self.viewport().height()
+        for blk_num in range(top_blk, bottom_blk + 1):
+            block = doc.findBlockByNumber(blk_num)
+            if not block.isValid():
+                continue
+            geom = self.blockBoundingGeometry(block).translated(offset)
+            if geom.bottom() < 0 or geom.top() > vp_h:
+                continue
+            x0 = float(self.cursorRect(QTextCursor(block)).left())
+            line_len = len(block.text())
+            if left_col == right_col:
+                cx = x0 + left_col * char_w
+                painter.setPen(hl)
+                painter.drawLine(
+                    int(round(cx)),
+                    int(round(geom.top())),
+                    int(round(cx)),
+                    int(round(geom.bottom())),
+                )
+            elif right_col > line_len:
+                v_start = max(left_col, line_len)
+                vx1 = x0 + v_start * char_w
+                vx2 = x0 + right_col * char_w
+                painter.fillRect(
+                    QRectF(vx1, geom.top(), vx2 - vx1, geom.height()),
+                    fill,
+                )
+
+    # -- mouse --------------------------------------------------------------- #
+    def mousePressEvent(self, event) -> None:  # noqa: N802 (API Qt)
+        if event.button() == Qt.MouseButton.LeftButton and (
+            self._rect_mode
+            or bool(event.modifiers() & Qt.KeyboardModifier.AltModifier)
+        ):
+            pos = self._pos_to_block_col(event.pos())
+            self._rect_dragging = True
+            self._set_cursor_to(*pos)
+            self._start_or_update_rect(pos, pos)
+            event.accept()
+            return
+        self.clear_rect_selection()
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:  # noqa: N802 (API Qt)
+        if self._rect_dragging and (event.buttons() & Qt.MouseButton.LeftButton):
+            pos = self._pos_to_block_col(event.pos())
+            self._set_cursor_to(*pos)
+            self._start_or_update_rect(self._rect_anchor, pos)
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802 (API Qt)
+        if self._rect_dragging and event.button() == Qt.MouseButton.LeftButton:
+            self._rect_dragging = False
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    # -- operazioni rettangolari --------------------------------------------- #
+    def copy(self) -> None:  # noqa: N802 (API Qt)
+        if not self._rect_active:
+            super().copy()
+            return
+        top_blk, bottom_blk, left_col, right_col = self._rect_bounds()
+        doc = self.document()
+        lines = []
+        for blk_num in range(top_blk, bottom_blk + 1):
+            block = doc.findBlockByNumber(blk_num)
+            text = block.text() if block.isValid() else ""
+            lines.append(text[left_col:right_col])
+        QApplication.clipboard().setText("\n".join(lines))
+
+    def cut(self) -> None:  # noqa: N802 (API Qt)
+        if not self._rect_active:
+            super().cut()
+            return
+        self.copy()
+        self._rect_replace_text("")
+
+    def paste(self) -> None:  # noqa: N802 (API Qt)
+        if not self._rect_active:
+            super().paste()
+            return
+        clip = QApplication.clipboard().text()
+        if not clip:
+            return
+        clip_lines = clip.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+        top_blk, bottom_blk, left_col, right_col = self._rect_bounds()
+        doc = self.document()
+        edit = QTextCursor(doc)
+        edit.beginEditBlock()
+        max_len = 0
+        for offset, blk_num in enumerate(range(top_blk, bottom_blk + 1)):
+            block = doc.findBlockByNumber(blk_num)
+            if not block.isValid():
+                continue
+            ins = (
+                clip_lines[0]
+                if len(clip_lines) == 1
+                else (clip_lines[offset] if offset < len(clip_lines) else "")
+            )
+            max_len = max(max_len, len(ins))
+            self._replace_in_block(edit, block, left_col, right_col, ins)
+        edit.endEditBlock()
+        new_col = left_col + max_len
+        self._start_or_update_rect((top_blk, new_col), (bottom_blk, new_col))
+        self._set_cursor_to(bottom_blk, new_col)
+
+    @staticmethod
+    def _replace_in_block(
+        edit: QTextCursor, block, left_col: int, right_col: int, text: str
+    ) -> None:
+        line_len = len(block.text())
+        if line_len < left_col:
+            if not text:
+                return  # nulla da cancellare oltre fine riga
+            edit.setPosition(block.position() + line_len)
+            edit.insertText(" " * (left_col - line_len) + text)
+            return
+        end_col = min(right_col, line_len)
+        edit.setPosition(block.position() + left_col)
+        edit.setPosition(
+            block.position() + end_col, QTextCursor.MoveMode.KeepAnchor
+        )
+        edit.insertText(text)
+
+    def _rect_replace_text(self, text: str) -> None:
+        top_blk, bottom_blk, left_col, right_col = self._rect_bounds()
+        doc = self.document()
+        edit = QTextCursor(doc)
+        edit.beginEditBlock()
+        for blk_num in range(top_blk, bottom_blk + 1):
+            block = doc.findBlockByNumber(blk_num)
+            if block.isValid():
+                self._replace_in_block(edit, block, left_col, right_col, text)
+        edit.endEditBlock()
+        new_col = left_col + len(text)
+        self._start_or_update_rect((top_blk, new_col), (bottom_blk, new_col))
+        self._set_cursor_to(bottom_blk, new_col)
+
+    def _rect_backspace(self) -> None:
+        top_blk, bottom_blk, left_col, right_col = self._rect_bounds()
+        if left_col < right_col:
+            self._rect_replace_text("")
+            return
+        if left_col == 0:
+            return
+        doc = self.document()
+        edit = QTextCursor(doc)
+        edit.beginEditBlock()
+        for blk_num in range(top_blk, bottom_blk + 1):
+            block = doc.findBlockByNumber(blk_num)
+            if block.isValid() and len(block.text()) >= left_col:
+                edit.setPosition(block.position() + left_col - 1)
+                edit.setPosition(
+                    block.position() + left_col,
+                    QTextCursor.MoveMode.KeepAnchor,
+                )
+                edit.removeSelectedText()
+        edit.endEditBlock()
+        new_col = left_col - 1
+        self._start_or_update_rect((top_blk, new_col), (bottom_blk, new_col))
+        self._set_cursor_to(bottom_blk, new_col)
+
+    def _rect_delete(self) -> None:
+        top_blk, bottom_blk, left_col, right_col = self._rect_bounds()
+        if left_col < right_col:
+            self._rect_replace_text("")
+            return
+        doc = self.document()
+        edit = QTextCursor(doc)
+        edit.beginEditBlock()
+        for blk_num in range(top_blk, bottom_blk + 1):
+            block = doc.findBlockByNumber(blk_num)
+            if block.isValid() and len(block.text()) > left_col:
+                edit.setPosition(block.position() + left_col)
+                edit.setPosition(
+                    block.position() + left_col + 1,
+                    QTextCursor.MoveMode.KeepAnchor,
+                )
+                edit.removeSelectedText()
+        edit.endEditBlock()
+
+    # -- tastiera ------------------------------------------------------------ #
+    def keyPressEvent(self, event) -> None:  # noqa: N802 (API Qt)
+        mods = event.modifiers()
+        key = event.key()
+
+        # Alt + Shift + Frecce / Home / End: inizia o estende selezione rettangolare
+        if (mods & Qt.KeyboardModifier.AltModifier) and (
+            mods & Qt.KeyboardModifier.ShiftModifier
+        ) and key in (
+            Qt.Key.Key_Up,
+            Qt.Key.Key_Down,
+            Qt.Key.Key_Left,
+            Qt.Key.Key_Right,
+            Qt.Key.Key_Home,
+            Qt.Key.Key_End,
+        ):
+            if not self._rect_active:
+                c = self.textCursor()
+                anchor = (c.blockNumber(), c.positionInBlock())
+                cur = anchor
+            else:
+                anchor = self._rect_anchor
+                cur = self._rect_cursor
+            blk, col = cur
+            max_blk = max(0, self.document().blockCount() - 1)
+            if key == Qt.Key.Key_Up:
+                blk = max(0, blk - 1)
+            elif key == Qt.Key.Key_Down:
+                blk = min(max_blk, blk + 1)
+            elif key == Qt.Key.Key_Left:
+                col = max(0, col - 1)
+            elif key == Qt.Key.Key_Right:
+                col += 1
+            elif key == Qt.Key.Key_Home:
+                col = 0
+            elif key == Qt.Key.Key_End:
+                block = self.document().findBlockByNumber(blk)
+                col = len(block.text()) if block.isValid() else col
+            self._start_or_update_rect(anchor, (blk, col))
+            self._set_cursor_to(blk, col)
+            event.accept()
+            return
+
+        if self._rect_active:
+            if key in (
+                Qt.Key.Key_Control,
+                Qt.Key.Key_Shift,
+                Qt.Key.Key_Alt,
+                Qt.Key.Key_AltGr,
+                Qt.Key.Key_Meta,
+                Qt.Key.Key_Super_L,
+                Qt.Key.Key_Super_R,
+            ):
+                super().keyPressEvent(event)
+                return
+            if key == Qt.Key.Key_Escape:
+                self.clear_rect_selection()
+                event.accept()
+                return
+            if event.matches(QKeySequence.StandardKey.Copy):
+                self.copy()
+                event.accept()
+                return
+            if event.matches(QKeySequence.StandardKey.Cut):
+                self.cut()
+                event.accept()
+                return
+            if event.matches(QKeySequence.StandardKey.Paste):
+                self.paste()
+                event.accept()
+                return
+            if key == Qt.Key.Key_Backspace:
+                self._rect_backspace()
+                event.accept()
+                return
+            if key == Qt.Key.Key_Delete:
+                self._rect_delete()
+                event.accept()
+                return
+            if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+                self.clear_rect_selection()
+                super().keyPressEvent(event)
+                return
+            if key == Qt.Key.Key_Tab:
+                self._rect_replace_text("    ")
+                event.accept()
+                return
+            if (
+                event.text()
+                and event.text() >= " "
+                and not (
+                    mods
+                    & (
+                        Qt.KeyboardModifier.ControlModifier
+                        | Qt.KeyboardModifier.MetaModifier
+                    )
+                )
+            ):
+                self._rect_replace_text(event.text())
+                event.accept()
+                return
+            # Qualsiasi altro tasto (es. frecce semplici, Ctrl+Z) esce dal rettangolo
+            self.clear_rect_selection()
+
+        super().keyPressEvent(event)
+
+
+# --------------------------------------------------------------------------- #
 #  Tab = un file Markdown aperto
 # --------------------------------------------------------------------------- #
 
@@ -2361,6 +2913,7 @@ class MarkdownTab(QWidget):
 
     notice = Signal(str)                 # messaggio per la barra di stato
     modified_changed = Signal(bool)      # stato "modificato" cambiato
+    line_ending_changed = Signal(str)    # terminatore di riga cambiato (LF/CRLF)
 
     # Hint una tantum alla prima anteprima visibile (condiviso fra le tab).
     _hint_shown = False
@@ -2379,6 +2932,7 @@ class MarkdownTab(QWidget):
         self._dark = dark
         self._prefs = prefs if prefs is not None else ViewPrefs()
         self._loading = False
+        self._line_ending = "\n"        # '\n' (LF) o '\r\n' (CRLF) su disco
 
         # Correzione rapida in anteprima (doppio click)
         self._preview_editing = False   # un blocco è editabile in place
@@ -2386,7 +2940,7 @@ class MarkdownTab(QWidget):
         self._last_html = ""            # documento mostrato (per localizzare)
 
         # Sorgente
-        self.editor = QPlainTextEdit()
+        self.editor = SourceEditor()
         self.editor.setPlaceholderText("Sorgente Markdown…")
         # Con uno stylesheet attivo il polish (es. all'ingresso in un tab)
         # può azzerare il font dell'editor: il filtro lo riapplica.
@@ -2471,6 +3025,19 @@ class MarkdownTab(QWidget):
     def is_modified(self) -> bool:
         return self.editor.document().isModified()
 
+    @property
+    def line_ending_label(self) -> str:
+        return "CRLF" if self._line_ending == "\r\n" else "LF"
+
+    def toggle_line_ending(self) -> str:
+        """Converte il terminatore di riga del documento tra LF e CRLF."""
+        self._line_ending = "\r\n" if self._line_ending == "\n" else "\n"
+        self.editor.document().setModified(True)
+        label = self.line_ending_label
+        self.line_ending_changed.emit(label)
+        self.notice.emit(f"Fine riga convertito in {label}")
+        return label
+
     def _on_text_changed(self) -> None:
         if self._loading or self._preview_editing:
             return  # durante la correzione in anteprima il render è differito
@@ -2482,17 +3049,24 @@ class MarkdownTab(QWidget):
         if self.path is None:
             return  # file nuovo: l'editor resta com'è (vuo o testo iniziale)
         try:
-            with open(self.path, "r", encoding="utf-8", errors="replace") as fh:
-                text = fh.read()
+            with open(
+                self.path, "r", encoding="utf-8", errors="replace", newline=""
+            ) as fh:
+                raw_text = fh.read()
         except OSError as exc:
             self.notice.emit(f"Impossibile leggere {os.path.basename(self.path)}: {exc}")
             return
-        if text == self.editor.toPlainText():
+        ending = detect_line_ending(raw_text)
+        text = convert_line_endings(raw_text, "\n")
+        if text == self.editor.toPlainText() and ending == self._line_ending:
             return
+        self._line_ending = ending
         self._loading = True
-        self.editor.setPlainText(text)
+        if text != self.editor.toPlainText():
+            self.editor.setPlainText(text)
         self.editor.document().setModified(False)
         self._loading = False
+        self.line_ending_changed.emit(self.line_ending_label)
 
     def save(self) -> bool:
         """Salva l'editor su disco. Ritorna True in caso di successo."""
@@ -2504,8 +3078,11 @@ class MarkdownTab(QWidget):
             watching = self.path in self.watcher.files()
             if watching:
                 self.watcher.removePath(self.path)
-            with open(self.path, "w", encoding="utf-8") as fh:
-                fh.write(self.editor.toPlainText())
+            out_text = convert_line_endings(
+                self.editor.toPlainText(), self._line_ending
+            )
+            with open(self.path, "w", encoding="utf-8", newline="") as fh:
+                fh.write(out_text)
             self.editor.document().setModified(False)
             if watching or os.path.isfile(self.path):
                 self.watcher.addPath(self.path)
@@ -2735,10 +3312,15 @@ class MarkdownTab(QWidget):
         self._src_font = font
         self.editor.setFont(font)
 
-        # Colore del testo e colorazione della sintassi
+        # Colore del testo, colorazione della sintassi e line folding
         if hasattr(self, "_highlighter"):
             self._highlighter.set_custom_color(prefs.src_color)
             self._highlighter.set_enabled(prefs.src_syntax)
+        self.editor.setLineWrapMode(
+            QPlainTextEdit.LineWrapMode.WidgetWidth
+            if prefs.src_line_wrap
+            else QPlainTextEdit.LineWrapMode.NoWrap
+        )
         self._update_editor_palette()
 
         # Riquadri (indipendenti l'uno dall'altro)
@@ -2843,8 +3425,8 @@ class MarkdownTab(QWidget):
         """Riallinea le tabelle che contengono le righe `blocks`.
 
         Usato dalla barra trova/sostituisci dopo una sostituzione che ne
-        cambia la larghezza: le colonne vengono riallineate, le righe che
-        superano la larghezza massima restano inalterate (format_table).
+        cambia la larghezza: i separatori di colonna vengono riallineati fino
+        al limite configurato (format_table).
         Da chiamare dentro il blocco di modifica della sostituzione, così un
         singolo annullamento riporta indietro testo e allineamento.
         """
@@ -2989,6 +3571,13 @@ class SettingsDialog(QDialog):
             "Evidenziazione di grassetti, titoli, codice, link, ecc."
         )
 
+        self.src_line_wrap_check = QCheckBox("A capo automatico (line folding)")
+        self.src_line_wrap_check.setChecked(prefs.src_line_wrap)
+        self.src_line_wrap_check.setToolTip(
+            "Se disattivato, ogni riga fino al ritorno a capo viene mostrata "
+            "su una sola riga con scorrimento orizzontale"
+        )
+
         src_lay.addWidget(QLabel("Font:"), 0, 0)
         src_lay.addWidget(self.src_family, 0, 1)
         src_lay.addWidget(QLabel("Dimensione:"), 1, 0)
@@ -2996,6 +3585,7 @@ class SettingsDialog(QDialog):
         src_lay.addWidget(self.src_color_check, 2, 0)
         src_lay.addWidget(self.src_color_btn, 2, 1, Qt.AlignmentFlag.AlignLeft)
         src_lay.addWidget(self.src_syntax_check, 3, 0, 1, 2)
+        src_lay.addWidget(self.src_line_wrap_check, 4, 0, 1, 2)
         src_lay.setColumnStretch(1, 1)
         root.addWidget(src_box)
 
@@ -3036,8 +3626,9 @@ class SettingsDialog(QDialog):
         self.table_max_width.setSuffix(" caratteri")
         self.table_max_width.setValue(prefs.table_max_width)
         self.table_max_width.setToolTip(
-            "Durante la riformattazione ASCII delle tabelle, le righe più "
-            "lunghe della larghezza massima restano inalterate"
+            "Durante la riformattazione ASCII delle tabelle, i separatori di "
+            "colonna vengono allineati fino a questa posizione; il resto della "
+            "riga viene ignorato"
         )
         edit_lay.addWidget(QLabel("Larghezza massima riga tabella:"), 0, 0)
         edit_lay.addWidget(self.table_max_width, 0, 1)
@@ -3113,6 +3704,7 @@ class SettingsDialog(QDialog):
         self.src_color = QColor(self._def_color)
         self._swatch(self.src_color_btn, self.src_color)
         self.src_syntax_check.setChecked(True)
+        self.src_line_wrap_check.setChecked(True)
         self.prev_family.setCurrentFont(QFont(self._def_prev_family))
         self.prev_size.setValue(DEFAULT_PREVIEW_SIZE)
         self.prev_color_check.setChecked(False)
@@ -3134,6 +3726,7 @@ class SettingsDialog(QDialog):
             src_size=int(self.src_size.value()),
             src_color=self.src_color.name() if self.src_color_check.isChecked() else "",
             src_syntax=self.src_syntax_check.isChecked(),
+            src_line_wrap=self.src_line_wrap_check.isChecked(),
             prev_family=prev_family,
             prev_size=int(self.prev_size.value()),
             prev_color=self.prev_color.name() if self.prev_color_check.isChecked() else "",
@@ -3178,6 +3771,10 @@ class MainWindow(QMainWindow):
         self._stack.addWidget(self._empty)
         self._stack.addWidget(self._tabs)
         self.setCentralWidget(self._stack)
+
+        self._eol_label = QLabel("")
+        self._eol_label.setContentsMargins(6, 0, 6, 0)
+        self.statusBar().addPermanentWidget(self._eol_label)
 
         self._build_menus()
         self._apply_theme()
@@ -3291,6 +3888,12 @@ class MainWindow(QMainWindow):
         self.act_find_prev.triggered.connect(lambda: self._find_next(True))
         edit_menu.addAction(self.act_find_prev)
 
+        edit_menu.addSeparator()
+
+        self.act_toggle_eol = QAction("Converti fine riga (LF ↔ CRLF)", self)
+        self.act_toggle_eol.triggered.connect(self.toggle_current_line_ending)
+        edit_menu.addAction(self.act_toggle_eol)
+
         # -- Visualizza ------------------------------------------------------- #
         view_menu = menubar.addMenu("&Visualizza")
 
@@ -3307,6 +3910,12 @@ class MainWindow(QMainWindow):
         self.act_show_preview.setShortcut(QKeySequence("Ctrl+Shift+P"))
         self.act_show_preview.toggled.connect(lambda v: self._set_pane("preview", v))
         view_menu.addAction(self.act_show_preview)
+
+        self.act_line_wrap = QAction("A capo automatico (&line folding)", self)
+        self.act_line_wrap.setCheckable(True)
+        self.act_line_wrap.setChecked(self.prefs.src_line_wrap)
+        self.act_line_wrap.toggled.connect(self._set_line_wrap)
+        view_menu.addAction(self.act_line_wrap)
 
         view_menu.addSeparator()
 
@@ -3343,11 +3952,23 @@ class MainWindow(QMainWindow):
         self.act_reformat_table = QAction("Ri&formatta tabella ASCII", self)
         self.act_reformat_table.setShortcut(QKeySequence("Ctrl+Alt+T"))
         self.act_reformat_table.setToolTip(
-            "Allinea le colonne della tabella sotto il cursore "
-            "(righe più lunghe della larghezza massima restano inalterate)"
+            "Allinea i separatori di colonna della tabella sotto il cursore "
+            "fino alla larghezza massima configurata"
         )
         self.act_reformat_table.triggered.connect(self.reformat_current_table)
         selection_menu.addAction(self.act_reformat_table)
+
+        selection_menu.addSeparator()
+
+        self.act_rect_mode = QAction("Modalità selezione &rettangolare", self)
+        self.act_rect_mode.setCheckable(True)
+        self.act_rect_mode.setShortcut(QKeySequence("Alt+Shift+R"))
+        self.act_rect_mode.setToolTip(
+            "Se attiva, il trascinamento del mouse seleziona per colonne "
+            "(altrimenti usare Alt+Click o Alt+Shift+Frecce)"
+        )
+        self.act_rect_mode.toggled.connect(self._set_rect_mode)
+        selection_menu.addAction(self.act_rect_mode)
 
         settings_menu = menubar.addMenu("&Impostazioni")
         self.act_settings = QAction("&Preferenze…", self)
@@ -3418,8 +4039,15 @@ class MainWindow(QMainWindow):
         """Collega i segnali di un tab e lo aggiunge alla finestra."""
         tab.notice.connect(lambda msg: self.statusBar().showMessage(msg, 6000))
         tab.modified_changed.connect(lambda _mod, t=tab: self._on_modified(t))
+        tab.line_ending_changed.connect(
+            lambda _eol, t=tab: self._on_line_ending_changed(t)
+        )
         # Stato delle azioni del menu Modifica
         tab.editor.cursorPositionChanged.connect(self._sync_edit_actions)
+        tab.editor.rect_selection_changed.connect(
+            lambda _b: self._sync_edit_actions()
+        )
+        tab.editor.set_rect_mode(self.act_rect_mode.isChecked())
         document = tab.editor.document()
         document.undoAvailable.connect(
             lambda _b: self._sync_edit_actions()
@@ -3575,6 +4203,18 @@ class MainWindow(QMainWindow):
         self.act_close.setEnabled(has_tabs)
         self.act_next.setEnabled(has_tabs)
         self.act_prev.setEnabled(has_tabs)
+        self.act_toggle_eol.setEnabled(has_tabs)
+        tab = self.current_tab()
+        if tab is not None:
+            cur_eol = tab.line_ending_label
+            target_eol = "LF" if cur_eol == "CRLF" else "CRLF"
+            self.act_toggle_eol.setText(
+                f"Converti fine riga in {target_eol} (attuale: {cur_eol})"
+            )
+            self._eol_label.setText(cur_eol)
+        else:
+            self.act_toggle_eol.setText("Converti fine riga (LF ↔ CRLF)")
+            self._eol_label.setText("")
         self._update_window_title()
         self._sync_edit_actions()
 
@@ -3605,6 +4245,7 @@ class MainWindow(QMainWindow):
         save_prefs(self.prefs)
         self._show_source, self._show_preview = mode_to_panes(prefs.mode)
         self._sync_pane_actions()
+        self._sync_line_wrap_action()
         for i in range(self._tabs.count()):
             tab = self._tabs.widget(i)
             if isinstance(tab, MarkdownTab):
@@ -3640,6 +4281,40 @@ class MainWindow(QMainWindow):
                 act.setChecked(value)
                 act.blockSignals(False)
 
+    def _sync_line_wrap_action(self) -> None:
+        if self.act_line_wrap.isChecked() != self.prefs.src_line_wrap:
+            self.act_line_wrap.blockSignals(True)
+            self.act_line_wrap.setChecked(self.prefs.src_line_wrap)
+            self.act_line_wrap.blockSignals(False)
+
+    def _set_line_wrap(self, enabled: bool) -> None:
+        self.prefs.src_line_wrap = enabled
+        save_prefs(self.prefs)
+        for i in range(self._tabs.count()):
+            tab = self._tabs.widget(i)
+            if isinstance(tab, MarkdownTab):
+                tab.set_prefs(self.prefs)
+
+    def _on_line_ending_changed(self, tab: MarkdownTab) -> None:
+        if tab is self.current_tab():
+            self._update_state()
+
+    def toggle_current_line_ending(self) -> None:
+        tab = self.current_tab()
+        if tab is not None:
+            tab.toggle_line_ending()
+            self._update_state()
+
+    def _set_rect_mode(self, enabled: bool) -> None:
+        for i in range(self._tabs.count()):
+            tab = self._tabs.widget(i)
+            if isinstance(tab, MarkdownTab):
+                tab.editor.set_rect_mode(enabled)
+        state = "attiva" if enabled else "disattivata"
+        self.statusBar().showMessage(
+            f"Modalità selezione rettangolare {state}", 3000
+        )
+
     def _apply_panes(self) -> None:
         for i in range(self._tabs.count()):
             tab = self._tabs.widget(i)
@@ -3662,7 +4337,14 @@ class MainWindow(QMainWindow):
 
         self.act_undo.setEnabled(has and document.isUndoAvailable())
         self.act_redo.setEnabled(has and document.isRedoAvailable())
-        selected = bool(cursor is not None and cursor.hasSelection())
+        selected = bool(
+            has
+            and (
+                tab.editor.has_any_selection()
+                if hasattr(tab.editor, "has_any_selection")
+                else (cursor is not None and cursor.hasSelection())
+            )
+        )
         self.act_cut.setEnabled(selected)
         self.act_copy.setEnabled(selected)
         self.act_paste.setEnabled(

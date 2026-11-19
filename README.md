@@ -18,19 +18,31 @@ Reader GUI per file Markdown con visualizzazione a **tab**, scritto in Python co
   (maiuscole/minuscole, parola intera, regex), frecce, contatore e campo
   *Sostituisci*; evidenziazione live dei risultati, `Enter`/`Shift+Enter` per
   scorrere, `Esc` per chiudere.
-- **Menu *Selezione***: **riformattazione ASCII delle tabelle** (`Ctrl+Alt+T`):
-  allinea le colonne della tabella sotto il cursore (o della selezione) secondo
-  gli allineamenti dichiarati; le righe che superano la **larghezza massima**
-  configurata restano inalterate, così come le righe che non ci starebbero mai.
-  Anche una **sostituzione dentro la tabella** che ne cambia la lunghezza
-  (cerca/sostituisci) riallinea automaticamente le colonne, nello stesso passo
-  di annullamento.
+- **Menu *Selezione***:
+  - **riformattazione ASCII delle tabelle** (`Ctrl+Alt+T`):
+    allinea le colonne della tabella sotto il cursore (o della selezione) secondo
+    gli allineamenti dichiarati; i separatori di colonna vengono allineati finché
+    non si raggiunge la **larghezza massima** configurata, poi vengono ignorati
+    per il resto della riga.
+    Anche una **sostituzione dentro la tabella** che ne cambia la lunghezza
+    (cerca/sostituisci) riallinea automaticamente le colonne, nello stesso passo
+    di annullamento.
+  - **selezione rettangolare (a colonne)**: con `Alt + Click/Trascina`,
+    `Alt + Shift + Frecce` oppure attivando **Modalità selezione rettangolare**
+    (`Alt+Shift+R`) per trascinare con il mouse senza `Alt`; supporta `Copia`,
+    `Taglia`, `Incolla`, `Canc`/`Backspace` e digitazione multi-riga in un unico
+    passo di annullamento.
 - **Menu *Impostazioni*** (`Ctrl+,`), con valori predefiniti pari al comportamento
   attuale e persistiti su disco (`~/.config/mdv/mdv.conf`):
   - **vista all'apertura**: split view, solo anteprima formattata o solo sorgente;
   - **font e dimensioni** per ciascun dei due riquadri;
   - **colore del testo** per ciascun riquadro (default: colore del tema);
   - **colorazione della sintassi** della sorgente, attivabile/disattivabile;
+  - **a capo automatico (line folding)** nella sorgente, attivabile/disattivabile
+    (anche dal menu *Visualizza*); se disattivato, ogni riga fino al ritorno
+    a capo viene mostrata su una sola riga;
+  - **conversione fine riga (LF ↔ CRLF)** nel menu *Modifica*, con indicatore
+    nella barra di stato e visualizzazione identica del sorgente in entrambi i casi;
   - **larghezza massima riga di tabella** (default 80 caratteri, 40–400)
     usata dalla riformattazione ASCII.
   Le modifiche si applicano subito a tutti i file aperti e vengono ricordate
@@ -108,6 +120,8 @@ MDV_NO_WEBENGINE=1 ./venv/bin/python mdv.py esempio.md
 | `Ctrl+H`         | Cerca e sostituisci             |
 | `F3` / `Shift+F3`| Risultato successivo/precedente |
 | `Ctrl+Alt+T`     | Riformatta la tabella ASCII     |
+| `Alt+Shift+R`    | Modalità selezione rettangolare |
+| `Alt+Click` / `Alt+Shift+Frecce` | Selezione rettangolare (a colonne) |
 | `Ctrl+Shift+E`   | Mostra/nascondi la sorgente     |
 | `Ctrl+Shift+P`   | Mostra/nascondi l'anteprima     |
 | Doppio click (anteprima) | Corregge il blocco in place |
